@@ -1,0 +1,1705 @@
+diff --git a/true-combat/src/CMakeLists.txt b/true-combat/src/CMakeLists.txt
+index 48e2ff125b9cb050a6d5bd68f2db228d90dcf328..85a91d721a7072e07ab752c6b6042c5b94a57d52 100644
+--- a/true-combat/src/CMakeLists.txt
++++ b/true-combat/src/CMakeLists.txt
+@@ -27,7 +27,7 @@ target_sources(qagame PRIVATE game/g_tce_hit_debug.c)
+ target_sources(qagame PRIVATE game/tce_pose_math.c game/bg_tce_pose_clock.c game/g_tce_pose.c)
+ target_sources(qagame PRIVATE game/bg_tce_pose_presentation.c game/bg_tce_pose_origin.c game/g_tce_pose_presentation.c)
+ target_sources(qagame PRIVATE "${TCE_ROOT_DIR}/compat/compat_pose_origin.c")
+-target_sources(qagame PRIVATE game/tce_nav_runtime.c)
++target_sources(qagame PRIVATE game/tce_nav_runtime.c game/ixvo_bots.c game/ixvo_bot_nav.c)
+ if(FEATURE_NAVSTUDIO)
+   target_sources(qagame PRIVATE game/tce_navgen.c)
+   set(tce_build_variant "navstudio")
+diff --git a/true-combat/src/game/g_active.c b/true-combat/src/game/g_active.c
+index 2451f0c03eddc16523ad3a7bb107d0c319a7532f..b29eb6ba75c4fbc0fd84ad8597be4a19c798c1d6 100644
+--- a/true-combat/src/game/g_active.c
++++ b/true-combat/src/game/g_active.c
+@@ -1786,7 +1786,7 @@ void ClientThink_real(gentity_t *ent)
+ 	// server cursor hints
+ 	// TC activate-held actions consume the same cursor hints as human input.
+ 	// Keep the SDK skip for other bots; Omni-bot needs the native plant/use hint.
+-	qboolean updateHints = !(ent->r.svFlags & SVF_BOT);
++	qboolean updateHints = !(ent->r.svFlags & SVF_BOT) || IXVO_IsBot(ent->s.number);
+ #ifdef FEATURE_OMNIBOT
+ 	updateHints = updateHints || Bot_Interface_IsOmnibot((int)(ent - g_entities));
+ #endif
+diff --git a/true-combat/src/game/g_client.c b/true-combat/src/game/g_client.c
+index 561a2825ba2272c693c781d13278c53dda8d0c17..3a4d9af27e6088bcea78e80afbaf47e6bcf8f0bb 100644
+--- a/true-combat/src/game/g_client.c
++++ b/true-combat/src/game/g_client.c
+@@ -1022,7 +1022,7 @@ static void TCE_SetSpawnWeapons(gclient_t *client)
+ #else
+ 	skill = (int)client->sess.skillpoints[tcClass] + 1;
+ #endif
+-	if ((flags & SVF_BOT)
++	if ((flags & SVF_BOT) && !IXVO_BotKeepsLoadout(client->ps.clientNum)
+ #ifdef FEATURE_OMNIBOT
+ 	    && !Bot_Interface_IsOmnibot(client->ps.clientNum)
+ #endif
+@@ -1692,6 +1692,12 @@ char *ClientConnect(int clientNum, qboolean firstTime, qboolean isBot)
+ 		trap_UnlinkEntity(ent);
+ 	}
+ 
++	if (isBot && !strcmp(Info_ValueForKey(userinfo, "ixvo_bot"), "1"))
++	{
++		if (!IXVO_BotsEnabled()) return "IXVO bots disabled";
++		IXVO_RestoreBot(clientNum, userinfo);
++	}
++
+ 	// get and distribute relevent paramters
+ 	G_LogPrintf("ClientConnect: %i\n", clientNum);
+ 	G_UpdateCharacter(client);
+@@ -2624,6 +2630,7 @@ void ClientDisconnect(int clientNum)
+ 		return;
+ 	}
+ 	TCE_LuaClientEvent("et_ClientDisconnect", clientNum);
++	IXVO_ForgetBot(clientNum);
+ 	G_TCEPresentationResetClient(ent);
+ 
+ 
+diff --git a/true-combat/src/game/g_cmds.c b/true-combat/src/game/g_cmds.c
+index e68756c9bb4f6842fff172fe4b01795b1b0bce6f..0a3973e2cc2762f0490a4e55ae3a92d17d6f77f9 100644
+--- a/true-combat/src/game/g_cmds.c
++++ b/true-combat/src/game/g_cmds.c
+@@ -1100,6 +1100,7 @@ qboolean SetTeam(gentity_t *ent, char *s, qboolean force, weapon_t w1, weapon_t
+ 	ClientUserinfoChanged(clientNum);
+ 
+ 	ClientBegin(clientNum);
++	if (team != oldTeam) IXVO_BotTeamJoined(ent);
+ 
+ 	// ydnar: restore old respawn count (players cannot jump from team to team to regain lives)
+ 	if (respawnsLeft >= 0 && oldTeam != TEAM_SPECTATOR)
+@@ -1872,6 +1873,9 @@ void G_Say(gentity_t *ent, gentity_t *target, int mode, const char *chatText)
+ 		G_Printf("%s%s\n", name, text);
+ 	}
+ 
++	if (mode == SAY_TEAM && !(ent->r.svFlags & SVF_BOT))
++		IXVO_BotListen(ent, text);
++
+ 	// send it to all the apropriate clients
+ 	for (j = 0; j < level.numConnectedClients; j++)
+ 	{
+diff --git a/true-combat/src/game/g_local.h b/true-combat/src/game/g_local.h
+index 758e839de2af1899a9bc0203c8a4e83bee159bb9..876974ecc110ad98d8e59d9e1f0bd271e174c0e7 100644
+--- a/true-combat/src/game/g_local.h
++++ b/true-combat/src/game/g_local.h
+@@ -1725,6 +1725,27 @@ extern int              saveGamePending;
+ 
+ #define FOFS(x) ((int)offsetof(gentity_t, x))
+ 
++extern vmCvar_t ixvo_bots, ixvo_botChat, ixvo_botMinPlayers, ixvo_botStandin, ixvo_botStandinTime;
++void IXVO_BotTeamJoined(gentity_t *ent);
++qboolean IXVO_BotKeepsLoadout(int slot);
++qboolean IXVO_BotsEnabled(void);
++void IXVO_InitBots(int seed);
++extern vmCvar_t ixvo_botExplore;
++void IXVO_BuildWalkGraph(void);
++int IXVO_PatrolGoal(gentity_t *ent);
++void IXVO_VisitNode(gentity_t *ent, int node);
++void IXVO_RestoreBot(int slot, const char *info);
++void IXVO_ForgetBot(int slot);
++qboolean IXVO_IsBot(int slot);
++qboolean IXVO_BotCommand(const char *cmd);
++void IXVO_BotFrame(void);
++void IXVO_BotListen(gentity_t *human, const char *text);
++qboolean IXVO_BotOrderMove(gentity_t *ent, usercmd_t *cmd);
++int IXVO_GoalNode(gentity_t *ent);
++qboolean IXVO_ObjectiveMove(gentity_t *ent, usercmd_t *cmd);
++void IXVO_TrackTarget(gentity_t *ent, vec3_t target);
++qboolean IXVO_BotReadyToFire(gentity_t *ent);
++void G_Say(gentity_t *ent, gentity_t *target, int mode, const char *text);
+ extern vmCvar_t g_gametype;
+ 
+ extern vmCvar_t g_log;
+diff --git a/true-combat/src/game/g_main.c b/true-combat/src/game/g_main.c
+index fe90443888ecea6d7d841e996375fb6d5421ff90..24d6a12a6dff77190c7dc07093a26fd16d279501 100644
+--- a/true-combat/src/game/g_main.c
++++ b/true-combat/src/game/g_main.c
+@@ -238,6 +238,8 @@ vmCvar_t        g_leanmode;
+ vmCvar_t        g_killmessage;
+ vmCvar_t        g_starthonor;
+ vmCvar_t        g_aabasetime;
++vmCvar_t ixvo_botExplore;
++vmCvar_t ixvo_bots, ixvo_botChat, ixvo_botMinPlayers, ixvo_botStandin, ixvo_botStandinTime;
+ vmCvar_t        g_botvar;
+ #ifdef FEATURE_NAVSTUDIO
+ vmCvar_t        bot_editWaypoints;
+@@ -326,6 +328,12 @@ cvarTable_t gameCvarTable[] =
+ 	{ &g_starthonor,              "g_starthonor",              "0",                          36, 0, 1, 0, 0                 },
+ 	{ &g_realism,                 "g_realism",                 "1",                          CVAR_SERVERINFO | CVAR_LATCH, 0, qtrue, qtrue},
+ 	{ &g_aabasetime,              "g_aabasetime",              "5",                          64, 0, 0, 1, 0                 },
++	{ &ixvo_bots, "ixvo_bots", "0", CVAR_LATCH | CVAR_ARCHIVE },
++	{ &ixvo_botStandin, "ixvo_botStandin", "0", CVAR_ARCHIVE },
++	{ &ixvo_botStandinTime, "ixvo_botStandinTime", "300", CVAR_ARCHIVE },
++	{ &ixvo_botExplore, "ixvo_botExplore", "1", CVAR_ARCHIVE },
++	{ &ixvo_botChat, "ixvo_botChat", "1", CVAR_ARCHIVE },
++	{ &ixvo_botMinPlayers, "ixvo_botMinPlayers", "0", CVAR_ARCHIVE },
+ 	{ &g_botvar,                  "g_botvar",                  "1.0",                        0, 0, 0, 1, 0                  },
+ #ifdef FEATURE_NAVSTUDIO
+ 	{ &bot_editWaypoints,         "bot_editWaypoints",         "0",                          256, 0, 0, 0, 0                },
+@@ -2462,10 +2470,11 @@ void G_InitGame(int levelTime, int randomSeed, int restart)
+ 	G_spawnPrintf(DP_MVSPAWN, level.time + 2000, NULL);
+ #endif
+ 	/* Original20061748..20061779: listen-server TC state initialization. */
+-	if (bot_enable.integer && !g_dedicated.integer)
++	if (IXVO_BotsEnabled() || (bot_enable.integer && !g_dedicated.integer))
+ 	{
+ 		tceNumBots = 0; tceNumBots = trap_Cvar_VariableIntegerValue("numBots");
+ 		TCE_InitNodes(); TCE_InitBotInfo();
++		if (IXVO_BotsEnabled()) IXVO_InitBots(randomSeed);
+ 	}
+ }
+ 
+@@ -5497,7 +5506,8 @@ uebrgpiebrpgibqeripgubeqrpigubqifejbgipegbrtibgurepqgbn%i", level.time)
+ 	G_UpdateCvars();
+ 	G_CheckOfficial();
+ 	/* Original2006478x: after frame4, update dynamic waypoint restrictions. */
+-	if (bot_enable.integer && level.framenum > 4)
++	if (IXVO_BotsEnabled()) IXVO_BotFrame();
++	if ((bot_enable.integer || IXVO_BotsEnabled()) && level.framenum > 4)
+ 	{
+ 		TCE_UpdateBotInfo(); TCE_UpdateNodes();
+ 	}
+diff --git a/true-combat/src/game/g_svcmds.c b/true-combat/src/game/g_svcmds.c
+index 3928d2f3b91241624b52c15e1b097c0e32b734c8..0d7621ff55bc639262284243cd0613c63f470c97 100644
+--- a/true-combat/src/game/g_svcmds.c
++++ b/true-combat/src/game/g_svcmds.c
+@@ -1661,6 +1661,8 @@ qboolean    ConsoleCommand(void)
+ #endif
+ 
+ 
++if (IXVO_BotCommand(cmd)) return qtrue;
++
+ /* TC ConsoleCommand has no single-player savegame command. */
+ 
+ 	if (Q_stricmp(cmd, "entitylist") == 0)
+diff --git a/true-combat/src/game/ixvo_bot_chat.h b/true-combat/src/game/ixvo_bot_chat.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..102a56286ad43053f4baa93322c343cb52439613
+--- /dev/null
++++ b/true-combat/src/game/ixvo_bot_chat.h
+@@ -0,0 +1,404 @@
++/* ixvo_bot_chat.h: bot chat lines from the offline phrase bank (bots-brain/phrases/phrases.txt).
++ *
++ * Self-contained C99, no engine includes, no allocation after botChatLoad. The game module does the
++ * file I/O and the sending; this file parses the bank, picks lines and paces them.
++ *
++ *   botChatLoad(text, len)                 parse phrases.txt once at map load (text may be freed after)
++ *   botChatSituation("contact_one")        key -> id, resolve once and cache
++ *   botChatSay(now, slot, team, pers, sit, &ctx, flags)   ask for a line; returns 1 if queued
++ *   botChatFrame(now, emit)                call every server frame; emits lines that are due
++ *   botChatCancel(slot, sit)               drop a queued line that went stale (enemy died, area cleared)
++ *   botChatRoundReset()                    call at round start
++ *   botChatSetVoice(slot, chatty, lower)   per-bot chattiness and typing style from the roster
++ *
++ * Pacing and picking follow the README: typing delay, one line per team every 1.5 s, three per bot
++ * per 10 s, per-situation cooldowns, chattiness per personality, an 8-line no-repeat window per team
++ * and situation, lines whose placeholders can't be filled are skipped, area names are cleaned, and a
++ * quarter of the lines are lower-cased. Orders (BOTCHAT_FORCE) skip chattiness and the bot cap.
++ * Contact and objective calls get a chattiness floor of 75%, so quiet bots still report what matters.
++ *
++ * Replies to another line (fu_ack_teammate_call, fu_thanks_teammate) must be requested from the emit
++ * callback of the line they answer, never when that line is queued, or the answer can appear first.
++ */
++#ifndef IXVO_BOT_CHAT_H
++#define IXVO_BOT_CHAT_H
++
++#include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#ifndef BOTCHAT_MAX_SLOTS
++#define BOTCHAT_MAX_SLOTS 64
++#endif
++#define BOTCHAT_MAX_TEAMS 4
++#define BOTCHAT_MAX_SITS 512
++#define BOTCHAT_MAX_LINES 16384
++#define BOTCHAT_ARENA (384 * 1024)
++#define BOTCHAT_KEYLEN 32
++#define BOTCHAT_WINDOW 8
++#define BOTCHAT_QUEUE 32
++#define BOTCHAT_MAX_TEXT 64      /* filled lines longer than this are skipped */
++#define BOTCHAT_OUT 128
++
++enum { BOTCHAT_ENTRY, BOTCHAT_ANCHOR, BOTCHAT_LURKER, BOTCHAT_SUPPORT, BOTCHAT_MARKSMAN, BOTCHAT_PERS };
++enum { BOTCHAT_TEAM = 0, BOTCHAT_ALL = 1 };
++enum { BOTCHAT_FORCE = 1,        /* reply to an order or ping: always answered */
++       BOTCHAT_NODELAY = 2,      /* no typing delay (death info, grenade warnings) */
++       BOTCHAT_DEAD = 4 };       /* speaker is dead: caller must only pass dead-allowed situations */
++enum { BOTCHAT_F_AREA = 1, BOTCHAT_F_COUNT = 2, BOTCHAT_F_NAME = 4, BOTCHAT_F_ENEMY = 8 };
++
++typedef struct { const char *area; int count; const char *name; const char *enemy; } botchat_ctx_t;
++typedef void (*botchat_emit_t)(int slot, int team, int channel, int sit, const char *text);
++
++typedef struct {
++    char key[BOTCHAT_KEYLEN];
++    unsigned char channel, group;
++    int cooldownMs;
++    int first[BOTCHAT_PERS], count[BOTCHAT_PERS];
++} botchat_sit_t;
++
++typedef struct { int dueAt, slot, team, sit, channel; char text[BOTCHAT_OUT]; } botchat_q_t;
++
++static struct {
++    int loaded, numSits, numLines, arenaUsed;
++    botchat_sit_t sits[BOTCHAT_MAX_SITS];
++    const char *line[BOTCHAT_MAX_LINES];
++    unsigned char lineFlags[BOTCHAT_MAX_LINES];
++    short hash[1024];
++    char arena[BOTCHAT_ARENA];
++    /* runtime */
++    unsigned seed;
++    int mode;                                         /* bot_chat cvar: 0 off, 1 team only, 2 team and all */
++    short recent[BOTCHAT_MAX_SITS][BOTCHAT_MAX_TEAMS][BOTCHAT_WINDOW];
++    int teamNext[BOTCHAT_MAX_TEAMS];                  /* earliest time the next line may be emitted */
++    int botTimes[BOTCHAT_MAX_SLOTS][3];               /* last three emit times per bot */
++    int botSitAt[BOTCHAT_MAX_SLOTS][8][2];            /* small per-bot cooldown table: sit, until */
++    int lastSit[BOTCHAT_MAX_SLOTS], lastAt[BOTCHAT_MAX_SLOTS];
++    char lastArea[BOTCHAT_MAX_SLOTS][32];
++    signed char voiceChatty[BOTCHAT_MAX_SLOTS];       /* per-bot chattiness from the roster, -1 = personality default */
++    unsigned char voiceLower[BOTCHAT_MAX_SLOTS];       /* percent of lines typed lower-case */
++    botchat_q_t q[BOTCHAT_QUEUE]; int qn;
++    int said, dropped, why[8];   /* why: 1 typing, 2 chattiness, 3 bot cap, 4 cooldown, 5 queue full, 6 stale, 7 no line fits */
++} botChat;
++
++static const char *const botChatPersNames[BOTCHAT_PERS] = { "entry", "anchor", "lurker", "support", "marksman" };
++static const char *const botChatGroups[] = { "contact", "action", "damage", "objective", "clutch", "round", "orders", "followup" };
++/* Chance (percent) that a chosen bot actually speaks. */
++static const int botChatChatty[BOTCHAT_PERS] = { 80, 60, 35, 80, 45 };
++
++static unsigned botChatRand(void)
++{
++    botChat.seed = botChat.seed * 1664525u + 1013904223u;
++    return (botChat.seed >> 8) & 0xffffff;
++}
++static unsigned botChatHashKey(const char *s)
++{
++    unsigned h = 2166136261u;
++    for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
++    return h & 1023;
++}
++
++/* Key -> situation id, or -1. */
++static int botChatSituation(const char *key)
++{
++    if (!botChat.loaded) return -1;
++    for (unsigned h = botChatHashKey(key), n = 0; n < 1024; n++, h = (h + 1) & 1023) {
++        int i = botChat.hash[h];
++        if (i < 0) return -1;
++        if (!strcmp(botChat.sits[i].key, key)) return i;
++    }
++    return -1;
++}
++
++static int botChatPersonality(const char *name)
++{
++    for (int i = 0; i < BOTCHAT_PERS; i++) if (!strcmp(name, botChatPersNames[i])) return i;
++    return -1;
++}
++
++static void botChatRoundReset(void)
++{
++    botChat.qn = 0;
++    memset(botChat.teamNext, 0, sizeof(botChat.teamNext));
++    memset(botChat.botSitAt, 0, sizeof(botChat.botSitAt));
++    for (int i = 0; i < BOTCHAT_MAX_SLOTS; i++) { botChat.lastSit[i] = -1; botChat.lastArea[i][0] = 0; botChat.botTimes[i][0] = botChat.botTimes[i][1] = botChat.botTimes[i][2] = -1000000; }
++}
++
++/* Parse phrases.txt. Returns the number of lines loaded, or a negative error:
++ * -1 too many situations, -2 too many lines, -3 arena full, -4 bad row, -5 unknown situation or personality. */
++static int botChatLoad(const char *text, int len)
++{
++    const char *p = text, *end = text + len;
++    int curSit = -1, curPers = -1;
++    botChat.loaded = 0; botChat.numSits = botChat.numLines = botChat.arenaUsed = 0;
++    botChat.mode = 2; if (!botChat.seed) botChat.seed = 0x7c0ffee;
++    memset(botChat.hash, 0xff, sizeof(botChat.hash));
++    memset(botChat.recent, 0xff, sizeof(botChat.recent));
++    for (int i = 0; i < BOTCHAT_MAX_SLOTS; i++) { botChat.botTimes[i][0] = botChat.botTimes[i][1] = botChat.botTimes[i][2] = -1000000; botChat.voiceChatty[i] = -1; botChat.voiceLower[i] = 25; }
++    while (p < end) {
++        const char *eol = memchr(p, '\n', (size_t)(end - p)); if (!eol) eol = end;
++        const char *e = eol; if (e > p && e[-1] == '\r') e--;
++        const char *f[6]; int fl[6], nf = 0;
++        if (e > p && *p != '#') {
++            const char *s = p;
++            while (nf < 6) {                                      /* split on TAB; last field keeps the rest */
++                const char *t = (nf < 5) ? memchr(s, '\t', (size_t)(e - s)) : NULL;
++                f[nf] = s; fl[nf] = (int)((t ? t : e) - s); nf++;
++                if (!t) break;
++                s = t + 1;
++            }
++            if (*p == '@') {
++                if (nf < 4 || fl[0] < 2 || fl[0] > BOTCHAT_KEYLEN) return -4;
++                if (botChat.numSits >= BOTCHAT_MAX_SITS) return -1;
++                botchat_sit_t *st = &botChat.sits[botChat.numSits];
++                memset(st, 0, sizeof(*st));
++                memcpy(st->key, f[0] + 1, (size_t)fl[0] - 1);
++                for (int g = 0; g < (int)(sizeof(botChatGroups) / sizeof(botChatGroups[0])); g++)
++                    if ((int)strlen(botChatGroups[g]) == fl[1] && !memcmp(botChatGroups[g], f[1], (size_t)fl[1])) st->group = (unsigned char)g;
++                st->channel = (fl[2] == 3 && !memcmp(f[2], "all", 3)) ? BOTCHAT_ALL : BOTCHAT_TEAM;
++                st->cooldownMs = atoi(f[3]) * 1000;
++                unsigned h = botChatHashKey(st->key);
++                while (botChat.hash[h] >= 0) h = (h + 1) & 1023;
++                botChat.hash[h] = (short)botChat.numSits;
++                curSit = botChat.numSits++; curPers = -1;
++            } else {
++                char key[BOTCHAT_KEYLEN + 1], pers[16];
++                if (nf < 3 || fl[0] > BOTCHAT_KEYLEN || fl[1] > 15 || fl[2] < 1) return -4;
++                /* a text row may itself contain no further tabs; rejoin anything split past field 2 */
++                int tl = (int)(e - f[2]);
++                memcpy(key, f[0], (size_t)fl[0]); key[fl[0]] = 0;
++                memcpy(pers, f[1], (size_t)fl[1]); pers[fl[1]] = 0;
++                int pi = botChatPersonality(pers);
++                if (curSit < 0 || pi < 0 || strcmp(botChat.sits[curSit].key, key)) return -5;
++                if (pi < curPers) return -5;                      /* rows must be grouped by personality */
++                if (botChat.numLines >= BOTCHAT_MAX_LINES) return -2;
++                if (botChat.arenaUsed + tl + 1 > BOTCHAT_ARENA) return -3;
++                char *dst = botChat.arena + botChat.arenaUsed;
++                memcpy(dst, f[2], (size_t)tl); dst[tl] = 0; botChat.arenaUsed += tl + 1;
++                unsigned char flags = 0;
++                if (strstr(dst, "{area}")) flags |= BOTCHAT_F_AREA;
++                if (strstr(dst, "{count}")) flags |= BOTCHAT_F_COUNT;
++                if (strstr(dst, "{name}")) flags |= BOTCHAT_F_NAME;
++                if (strstr(dst, "{enemy}")) flags |= BOTCHAT_F_ENEMY;
++                botchat_sit_t *st = &botChat.sits[curSit];
++                if (!st->count[pi]) st->first[pi] = botChat.numLines;
++                st->count[pi]++; curPers = pi;
++                botChat.lineFlags[botChat.numLines] = flags;
++                botChat.line[botChat.numLines++] = dst;
++            }
++        }
++        p = eol == end ? end : eol + 1;
++    }
++    botChat.loaded = botChat.numLines > 0;
++    botChatRoundReset();
++    return botChat.numLines;
++}
++
++/* Clean a location or player name for chat: strip ^x colour codes and control characters, trim,
++ * drop a leading article and fix ALL CAPS (area names only). */
++static void botChatClean(const char *in, char *out, int outLen, int isArea)
++{
++    int n = 0, letters = 0, upper = 0;
++    if (!in) in = "";
++    for (const char *s = in; *s && n < outLen - 1; s++) {
++        if (*s == '^' && s[1]) { s++; continue; }
++        unsigned char c = (unsigned char)*s;
++        if (c < 32 || c == '"' || c == ';' || c == '%' || c == '{' || c == '}') c = ' ';
++        if (c == ' ' && (n == 0 || out[n - 1] == ' ')) continue;
++        out[n++] = (char)c;
++    }
++    while (n > 0 && strchr(" .,:;-_", out[n - 1])) n--;
++    out[n] = 0;
++    if (!isArea) return;
++    static const char *const art[] = { "the ", "a ", "an " };
++    for (int i = 0; i < 3; i++) {
++        size_t l = strlen(art[i]);
++        if ((size_t)n > l) {
++            int same = 1;
++            for (size_t k = 0; k < l; k++) { char c = out[k]; if (c >= 'A' && c <= 'Z') c += 32; if (c != art[i][k]) same = 0; }
++            if (same) { memmove(out, out + l, (size_t)n - l + 1); n -= (int)l; break; }
++        }
++    }
++    for (int i = 0; i < n; i++) { char c = out[i]; if (c >= 'a' && c <= 'z') letters++; else if (c >= 'A' && c <= 'Z') { letters++; upper++; } }
++    if (n > 3 && letters && upper == letters)
++        for (int i = 0, start = 1; i < n; i++) {
++            char c = out[i];
++            if (c >= 'A' && c <= 'Z') { if (!start) out[i] = (char)(c + 32); start = 0; } else start = (c == ' ');
++        }
++}
++
++static int botChatLower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
++static int botChatAlnum(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }
++
++/* 1 when a landmark word of the area name already appears in the line ("he's on the roof" + "Roof"). */
++static int botChatAreaClash(const char *line, const char *area)
++{
++    static const char *const marks[] = { "roof", "window", "ladder", "door", "spawn", "bomb", "site", "stairs", "water", "smoke", "back", "top", "long", "mid" };
++    for (int m = 0; m < (int)(sizeof(marks) / sizeof(marks[0])); m++) {
++        size_t l = strlen(marks[m]); int inArea = 0, inLine = 0;
++        for (int pass = 0; pass < 2; pass++) {
++            const char *s = pass ? line : area;
++            for (const char *w = s; *w; w++) {
++                if (w != s && botChatAlnum((unsigned char)w[-1])) continue;
++                size_t k = 0; while (k < l && botChatLower((unsigned char)w[k]) == marks[m][k]) k++;
++                if (k == l && !botChatAlnum((unsigned char)w[l])) { if (pass) inLine = 1; else inArea = 1; }
++            }
++        }
++        if (inArea && inLine) return 1;
++    }
++    return 0;
++}
++
++/* Fill placeholders. Returns length, or -1 when it does not fit. */
++static int botChatFill(const char *line, const char *area, int count, const char *name, const char *enemy, char *out, int outLen)
++{
++    int n = 0;
++    for (const char *s = line; *s; ) {
++        const char *rep = NULL; char num[12]; int skip = 0;
++        if (*s == '{') {
++            if (!strncmp(s, "{area}", 6)) { rep = area; skip = 6; }
++            else if (!strncmp(s, "{count}", 7)) { snprintf(num, sizeof(num), "%d", count); rep = num; skip = 7; }
++            else if (!strncmp(s, "{name}", 6)) { rep = name; skip = 6; }
++            else if (!strncmp(s, "{enemy}", 7)) { rep = enemy; skip = 7; }
++        }
++        if (rep) { int l = (int)strlen(rep); if (n + l >= outLen) return -1; memcpy(out + n, rep, (size_t)l); n += l; s += skip; }
++        else { if (n + 1 >= outLen) return -1; out[n++] = *s++; }
++    }
++    out[n] = 0;
++    return n;
++}
++
++/* Pick and fill one line. Returns 1 and writes `out`, or 0 when nothing fits. */
++static int botChatPick(int sit, int pers, int team, const botchat_ctx_t *ctx, char *out, int outLen, int lowerPct)
++{
++    static const botchat_ctx_t none = { 0, 0, 0, 0 };
++    char area[32], name[32], enemy[32], buf[BOTCHAT_OUT];
++    if (!botChat.loaded || sit < 0 || sit >= botChat.numSits || pers < 0 || pers >= BOTCHAT_PERS) return 0;
++    if (team < 0 || team >= BOTCHAT_MAX_TEAMS) team = 0;
++    if (!ctx) ctx = &none;
++    botChatClean(ctx->area, area, sizeof(area), 1);
++    botChatClean(ctx->name, name, sizeof(name), 0);
++    botChatClean(ctx->enemy, enemy, sizeof(enemy), 0);
++    if (strlen(name) > 12) { char *sp = strrchr(name, ' '); if (sp && sp[1]) memmove(name, sp + 1, strlen(sp + 1) + 1); name[12] = 0; }
++    if (strlen(enemy) > 12) { char *sp = strrchr(enemy, ' '); if (sp && sp[1]) memmove(enemy, sp + 1, strlen(sp + 1) + 1); enemy[12] = 0; }
++    unsigned have = (area[0] ? BOTCHAT_F_AREA : 0) | (ctx->count > 0 ? BOTCHAT_F_COUNT : 0) | (name[0] ? BOTCHAT_F_NAME : 0) | (enemy[0] ? BOTCHAT_F_ENEMY : 0);
++    const botchat_sit_t *st = &botChat.sits[sit];
++    /* one time in ten borrow another personality's voice, so the voices overlap a little */
++    int usePers = pers;
++    if (botChatRand() % 10 == 0) usePers = (int)(botChatRand() % BOTCHAT_PERS);
++    if (!st->count[usePers]) usePers = pers;
++    short *recent = botChat.recent[sit][team];
++    for (int relax = 0; relax < 2; relax++) {                    /* second pass ignores the no-repeat window */
++        int n = st->count[usePers], start = n ? (int)(botChatRand() % (unsigned)n) : 0;
++        for (int k = 0; k < n; k++) {
++            int li = st->first[usePers] + (start + k) % n, seen = 0;
++            if (botChat.lineFlags[li] & ~have) continue;         /* needs a placeholder we can't fill */
++            if (!relax) for (int r = 0; r < BOTCHAT_WINDOW; r++) if (recent[r] == li) seen = 1;
++            if (seen) continue;
++            if ((botChat.lineFlags[li] & BOTCHAT_F_AREA) && botChatAreaClash(botChat.line[li], area)) continue;
++            int len = botChatFill(botChat.line[li], area, ctx->count, name, enemy, buf, sizeof(buf));
++            if (len < 0 || len > BOTCHAT_MAX_TEXT || len >= outLen) continue;
++            memmove(recent + 1, recent, sizeof(short) * (BOTCHAT_WINDOW - 1)); recent[0] = (short)li;
++            /* typing style: some lines go out lower-case without the final full stop (25% by default, per bot via the roster) */
++            if ((int)(botChatRand() % 100) < lowerPct) {
++                const char *keep[3] = { area, name, enemy };
++                for (int i = 0; buf[i]; i++) {
++                    int protect = 0;
++                    for (int w = 0; w < 3; w++) { size_t l = strlen(keep[w]); if (l && !strncmp(buf + i, keep[w], l)) { i += (int)l - 1; protect = 1; break; } }
++                    if (!protect) buf[i] = (char)botChatLower((unsigned char)buf[i]);
++                }
++                if (len > 1 && buf[len - 1] == '.' && buf[len - 2] != '.') buf[--len] = 0;
++            }
++            memcpy(out, buf, (size_t)len + 1);
++            return 1;
++        }
++        if (usePers != pers) { usePers = pers; relax = -1; }     /* borrowed voice had nothing: use our own */
++    }
++    return 0;
++}
++
++/* Ask for a line. Applies mode, chattiness, cooldowns and caps, then queues it with a typing delay. */
++static int botChatSay(int now, int slot, int team, int pers, int sit, const botchat_ctx_t *ctx, int flags)
++{
++    if (!botChat.loaded || !botChat.mode || sit < 0 || sit >= botChat.numSits) return 0;
++    if (slot < 0 || slot >= BOTCHAT_MAX_SLOTS || team < 0 || team >= BOTCHAT_MAX_TEAMS) return 0;
++    const botchat_sit_t *st = &botChat.sits[sit];
++    int force = flags & BOTCHAT_FORCE;
++    if (st->channel == BOTCHAT_ALL && botChat.mode < 2) return 0;
++    for (int i = 0; i < botChat.qn; i++) if (botChat.q[i].slot == slot) { botChat.dropped++; botChat.why[1]++; return 0; }   /* still typing */
++    if (!force) {
++        int chatty = botChat.voiceChatty[slot] >= 0 ? botChat.voiceChatty[slot] : botChatChatty[pers];
++        /* information the team needs (contacts, objective events, what a dying bot saw) is not small talk:
++         * even a quiet bot reports most of it */
++        if (st->group == 0 || st->group == 3 || (flags & BOTCHAT_DEAD)) chatty = 75 + chatty / 4;
++        if ((int)(botChatRand() % 100) >= chatty) { botChat.dropped++; botChat.why[2]++; return 0; }
++        if (now >= botChat.botTimes[slot][2] && now - botChat.botTimes[slot][2] < 10000) { botChat.dropped++; botChat.why[3]++; return 0; }                    /* 3 per 10 s */
++        for (int i = 0; i < 8; i++) if (botChat.botSitAt[slot][i][0] == sit + 1 && now < botChat.botSitAt[slot][i][1]) { botChat.dropped++; botChat.why[4]++; return 0; }
++    }
++    if (botChat.qn >= BOTCHAT_QUEUE) { botChat.dropped++; botChat.why[5]++; return 0; }
++    botchat_q_t *q = &botChat.q[botChat.qn];
++    if (!botChatPick(sit, pers, team, ctx, q->text, sizeof(q->text), botChat.voiceLower[slot])) { botChat.why[7]++; return 0; }
++    int delay = (flags & BOTCHAT_NODELAY) ? 100 : 400 + (int)(botChatRand() % 800) + 12 * (int)strlen(q->text);
++    q->dueAt = now + delay; q->slot = slot; q->team = team; q->sit = sit; q->channel = st->channel;
++    botChat.qn++;
++    if (st->cooldownMs) {
++        int oldest = 0;
++        for (int i = 1; i < 8; i++) if (botChat.botSitAt[slot][i][1] < botChat.botSitAt[slot][oldest][1]) oldest = i;
++        botChat.botSitAt[slot][oldest][0] = sit + 1; botChat.botSitAt[slot][oldest][1] = now + st->cooldownMs;
++    }
++    botChat.lastSit[slot] = sit; botChat.lastAt[slot] = now;
++    if (ctx && ctx->area) botChatClean(ctx->area, botChat.lastArea[slot], sizeof(botChat.lastArea[slot]), 1);
++    return 1;
++}
++
++/* Per-bot voice from the roster: chattiness 0..100 (-1 keeps the personality default) and how often it types lower-case. */
++static void botChatSetVoice(int slot, int chatty, int lowerPct)
++{
++    if (slot < 0 || slot >= BOTCHAT_MAX_SLOTS) return;
++    botChat.voiceChatty[slot] = (signed char)(chatty > 100 ? 100 : chatty);
++    botChat.voiceLower[slot] = (unsigned char)(lowerPct < 0 ? 25 : lowerPct > 100 ? 100 : lowerPct);
++}
++
++/* Drop a queued line (sit < 0: any) because it went stale before it was "typed". */
++static void botChatCancel(int slot, int sit)
++{
++    for (int i = 0; i < botChat.qn; i++)
++        if (botChat.q[i].slot == slot && (sit < 0 || botChat.q[i].sit == sit)) { botChat.q[i] = botChat.q[--botChat.qn]; i--; }
++}
++
++/* Emit queued lines that are due, oldest first, at most one per team every 1.5 s. Lines that wait more
++ * than 2.5 s past their time are dropped: a late call-out is worse than none. */
++static void botChatFrame(int now, botchat_emit_t emit)
++{
++    for (;;) {
++        int best = -1;
++        for (int i = 0; i < botChat.qn; i++) {
++            botchat_q_t *q = &botChat.q[i];
++            if (now - q->dueAt > 2500) { botChat.dropped++; botChat.why[6]++; *q = botChat.q[--botChat.qn]; i--; continue; }
++            if (q->dueAt > now || now < botChat.teamNext[q->team]) continue;
++            if (best < 0 || q->dueAt < botChat.q[best].dueAt) best = i;
++        }
++        if (best < 0) return;
++        botchat_q_t q = botChat.q[best];
++        botChat.q[best] = botChat.q[--botChat.qn];
++        {   /* bot-brain: objective calls and order replies keep the 1.5 s team gap; everything else waits 4 s (team chat stayed too busy at 1.5 s) */
++            int g = q.sit >= 0 && q.sit < botChat.numSits ? botChat.sits[q.sit].group : 0;
++            botChat.teamNext[q.team] = now + (g == 3 || g == 6 ? 1500 : 4000);
++        }
++        botChat.botTimes[q.slot][2] = botChat.botTimes[q.slot][1];
++        botChat.botTimes[q.slot][1] = botChat.botTimes[q.slot][0];
++        botChat.botTimes[q.slot][0] = now;
++        botChat.said++;
++        if (emit) emit(q.slot, q.team, q.channel, q.sit, q.text);
++    }
++}
++
++/* Follow-up memory: what this bot last called, for fu_still_there and friends. */
++static int botChatLastCall(int slot, int now, int withinMs, const char **area)
++{
++    if (slot < 0 || slot >= BOTCHAT_MAX_SLOTS || botChat.lastSit[slot] < 0 || now - botChat.lastAt[slot] > withinMs) return -1;
++    if (area) *area = botChat.lastArea[slot];
++    return botChat.lastSit[slot];
++}
++
++#endif /* IXVO_BOT_CHAT_H */
+diff --git a/true-combat/src/game/ixvo_bot_listen.h b/true-combat/src/game/ixvo_bot_listen.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..286de529e445f6d1e76a9f9f4c288763070e71d1
+--- /dev/null
++++ b/true-combat/src/game/ixvo_bot_listen.h
+@@ -0,0 +1,270 @@
++/* ixvo_bot_listen.h: understand what a human types to the bots.
++ *
++ * Turns a chat line ("viper hold", "bots push A", "smoke mid pls", "are you a bot?", "ty") into an intent,
++ * who it is for and which area it names. Keyword matching only, done locally: no language model, nothing
++ * leaves the server. Self-contained C99, no allocation.
++ *
++ *   botlisten_t r;
++ *   if (botListenParse(text, botNames, numBots, areaNames, numAreas, &r)) { ... r.intent, r.target, r.area ... }
++ *   const char *key = botListenReplyKey(r.intent, canDo);    reply situation in the phrase bank
++ *
++ * The parser never decides whether a bot obeys. It reports `addressed`:
++ *   BOTLISTEN_NAMED  the line names a bot ("viper hold")            -> that bot answers
++ *   BOTLISTEN_GROUP  it says bots / team / all / guys / everyone    -> nearby free bots answer
++ *   BOTLISTEN_NONE   nobody is addressed ("push a")                 -> obey only for a squad leader, or ignore
++ * Social lines (thanks, gg, hi) and questions are meant for whoever fits; the caller picks one bot to answer.
++ */
++#ifndef IXVO_BOT_LISTEN_H
++#define IXVO_BOT_LISTEN_H
++
++#include <string.h>
++
++enum {
++    BL_NONE,
++    /* orders */
++    BL_FOLLOW, BL_HOLD, BL_PUSH, BL_GOTO, BL_REGROUP, BL_COVER, BL_WATCH, BL_SMOKE, BL_FLASH, BL_FRAG,
++    BL_DROP_BOMB, BL_TAKE_BOMB, BL_PLANT, BL_DEFUSE, BL_SPREAD, BL_QUIET, BL_FLANK, BL_WAIT, BL_FALLBACK,
++    BL_LEAD, BL_STACK, BL_CANCEL, BL_HELP,
++    /* questions */
++    BL_ASK_STATUS, BL_ASK_COUNT, BL_ASK_BOMB, BL_ASK_BOT, BL_ASK_OTHER,
++    /* social */
++    BL_THANKS, BL_SORRY, BL_GREETING, BL_BYE, BL_GG, BL_GLHF, BL_COMPLIMENT, BL_INSULT, BL_BLAME, BL_LAUGH, BL_NICE_TRY,
++    BL_NAME_ONLY,
++    BL_COUNT
++};
++enum { BOTLISTEN_NONE, BOTLISTEN_GROUP, BOTLISTEN_NAMED };
++
++typedef struct {
++    int intent;       /* BL_* */
++    int addressed;    /* BOTLISTEN_* */
++    int target;       /* index into botNames when addressed == BOTLISTEN_NAMED, else -1 */
++    int area;         /* index into areaNames, or -1 */
++    int negated;      /* the line said don't / stop / no ... */
++} botlisten_t;
++
++#define BL_ORDER(i)    ((i) >= BL_FOLLOW && (i) <= BL_HELP)
++#define BL_QUESTION(i) ((i) >= BL_ASK_STATUS && (i) <= BL_ASK_OTHER)
++#define BL_SOCIAL(i)   ((i) >= BL_THANKS && (i) <= BL_NICE_TRY)
++
++static const char *const botListenNames[BL_COUNT] = {
++    "none", "follow", "hold", "push", "goto", "regroup", "cover", "watch", "smoke", "flash", "frag",
++    "drop_bomb", "take_bomb", "plant", "defuse", "spread", "quiet", "flank", "wait", "fallback",
++    "lead", "stack", "cancel", "help",
++    "ask_status", "ask_count", "ask_bomb", "ask_bot", "ask_other",
++    "thanks", "sorry", "greeting", "bye", "gg", "glhf", "compliment", "insult", "blame", "laugh", "nice_try",
++    "name_only"
++};
++
++/* Phrases are matched on whole words after clean-up. Longer phrases win. A few Dutch, French and German
++ * words are included because that is who plays here. */
++static const struct { unsigned char intent; const char *phrase; } botListenTable[] = {
++    { BL_ASK_BOT, "are you a bot" }, { BL_ASK_BOT, "are you bots" }, { BL_ASK_BOT, "are you bot" }, { BL_ASK_BOT, "r u a bot" }, { BL_ASK_BOT, "u a bot" },
++    { BL_ASK_BOT, "you a bot" }, { BL_ASK_BOT, "is this a bot" }, { BL_ASK_BOT, "are these bots" }, { BL_ASK_BOT, "bot or human" }, { BL_ASK_BOT, "are you real" },
++    { BL_ASK_BOT, "are you human" }, { BL_ASK_BOT, "ben je een bot" }, { BL_ASK_BOT, "es tu un bot" }, { BL_ASK_BOT, "bist du ein bot" },
++    { BL_ASK_STATUS, "where are you" }, { BL_ASK_STATUS, "where r u" }, { BL_ASK_STATUS, "where u at" }, { BL_ASK_STATUS, "where you at" }, { BL_ASK_STATUS, "your position" },
++    { BL_ASK_STATUS, "status" }, { BL_ASK_STATUS, "what are you doing" }, { BL_ASK_STATUS, "waar ben je" }, { BL_ASK_STATUS, "ou es tu" }, { BL_ASK_STATUS, "wo bist du" },
++    { BL_ASK_COUNT, "how many" }, { BL_ASK_COUNT, "how much left" }, { BL_ASK_COUNT, "hoeveel" }, { BL_ASK_COUNT, "combien" }, { BL_ASK_COUNT, "wie viele" },
++    { BL_ASK_BOMB, "who has the bomb" }, { BL_ASK_BOMB, "who has bomb" }, { BL_ASK_BOMB, "whos got the bomb" }, { BL_ASK_BOMB, "where is the bomb" }, { BL_ASK_BOMB, "wheres the bomb" },
++    { BL_ASK_BOMB, "where bomb" }, { BL_ASK_BOMB, "wheres bomb" }, { BL_ASK_BOMB, "who bomb" }, { BL_ASK_BOMB, "bomb where" }, { BL_ASK_BOMB, "wie heeft de bom" },
++    { BL_ASK_OTHER, "where are they" }, { BL_ASK_OTHER, "where is he" }, { BL_ASK_OTHER, "wheres he" }, { BL_ASK_OTHER, "any info" }, { BL_ASK_OTHER, "info" }, { BL_ASK_OTHER, "seen anyone" },
++
++    { BL_DROP_BOMB, "drop the bomb" }, { BL_DROP_BOMB, "drop bomb" }, { BL_DROP_BOMB, "give me the bomb" }, { BL_DROP_BOMB, "give bomb" }, { BL_DROP_BOMB, "drop it" }, { BL_DROP_BOMB, "bomb to me" },
++    { BL_TAKE_BOMB, "take the bomb" }, { BL_TAKE_BOMB, "take bomb" }, { BL_TAKE_BOMB, "get the bomb" }, { BL_TAKE_BOMB, "get bomb" }, { BL_TAKE_BOMB, "pick up the bomb" },
++    { BL_TAKE_BOMB, "grab the bomb" }, { BL_TAKE_BOMB, "grab bomb" }, { BL_TAKE_BOMB, "carry the bomb" }, { BL_TAKE_BOMB, "pak de bom" },
++    { BL_PLANT, "plant" }, { BL_PLANT, "plant the bomb" }, { BL_PLANT, "plant it" }, { BL_PLANT, "plant here" },
++    { BL_DEFUSE, "defuse" }, { BL_DEFUSE, "defuse it" }, { BL_DEFUSE, "defuse the bomb" }, { BL_DEFUSE, "get on the bomb" }, { BL_DEFUSE, "ontmantel" },
++    { BL_FOLLOW, "follow me" }, { BL_FOLLOW, "follow" }, { BL_FOLLOW, "with me" }, { BL_FOLLOW, "on me" }, { BL_FOLLOW, "come with me" }, { BL_FOLLOW, "stay with me" },
++    { BL_FOLLOW, "come here" }, { BL_FOLLOW, "come" }, { BL_FOLLOW, "volg mij" }, { BL_FOLLOW, "volg" }, { BL_FOLLOW, "suis moi" }, { BL_FOLLOW, "folg mir" }, { BL_FOLLOW, "kom" },
++    { BL_HOLD, "hold" }, { BL_HOLD, "hold here" }, { BL_HOLD, "hold position" }, { BL_HOLD, "hold this" }, { BL_HOLD, "stay" }, { BL_HOLD, "stay here" }, { BL_HOLD, "stay there" },
++    { BL_HOLD, "hold site" }, { BL_HOLD, "defend" }, { BL_HOLD, "camp" }, { BL_HOLD, "blijf" }, { BL_HOLD, "blijf hier" }, { BL_HOLD, "reste" }, { BL_HOLD, "reste ici" }, { BL_HOLD, "bleib" },
++    { BL_PUSH, "push" }, { BL_PUSH, "push now" }, { BL_PUSH, "rush" }, { BL_PUSH, "go go" }, { BL_PUSH, "go go go" }, { BL_PUSH, "attack" }, { BL_PUSH, "charge" }, { BL_PUSH, "lets go" },
++    { BL_PUSH, "move up" }, { BL_PUSH, "go in" }, { BL_PUSH, "all in" }, { BL_PUSH, "aanvallen" }, { BL_PUSH, "allez" }, { BL_PUSH, "los" }, { BL_PUSH, "execute" },
++    { BL_GOTO, "go" }, { BL_GOTO, "go to" }, { BL_GOTO, "move to" }, { BL_GOTO, "take" }, { BL_GOTO, "rotate" }, { BL_GOTO, "rotate to" }, { BL_GOTO, "head to" }, { BL_GOTO, "ga naar" }, { BL_GOTO, "va a" },
++    { BL_REGROUP, "regroup" }, { BL_REGROUP, "group up" }, { BL_REGROUP, "group" }, { BL_REGROUP, "together" }, { BL_REGROUP, "stick together" }, { BL_REGROUP, "come back" }, { BL_REGROUP, "gather" },
++    { BL_COVER, "cover me" }, { BL_COVER, "cover" }, { BL_COVER, "watch my back" }, { BL_COVER, "protect me" }, { BL_COVER, "dek mij" }, { BL_COVER, "couvre moi" },
++    { BL_WATCH, "watch" }, { BL_WATCH, "look at" }, { BL_WATCH, "check" }, { BL_WATCH, "guard" }, { BL_WATCH, "eyes on" }, { BL_WATCH, "keep an eye on" },
++    { BL_SMOKE, "smoke" }, { BL_SMOKE, "throw smoke" }, { BL_SMOKE, "need smoke" }, { BL_SMOKE, "rook" }, { BL_SMOKE, "fumee" },
++    { BL_FLASH, "flash" }, { BL_FLASH, "flash me" }, { BL_FLASH, "throw flash" }, { BL_FLASH, "stun" }, { BL_FLASH, "flashbang" }, { BL_FLASH, "blind them" },
++    { BL_FRAG, "nade" }, { BL_FRAG, "grenade" }, { BL_FRAG, "frag" }, { BL_FRAG, "throw nade" }, { BL_FRAG, "nade it" }, { BL_FRAG, "granaat" },
++    { BL_SPREAD, "spread" }, { BL_SPREAD, "spread out" }, { BL_SPREAD, "split" }, { BL_SPREAD, "split up" }, { BL_SPREAD, "dont stack" }, { BL_SPREAD, "verspreid" },
++    { BL_QUIET, "quiet" }, { BL_QUIET, "walk" }, { BL_QUIET, "shh" }, { BL_QUIET, "silent" }, { BL_QUIET, "sneak" }, { BL_QUIET, "be quiet" }, { BL_QUIET, "stop running" }, { BL_QUIET, "no noise" }, { BL_QUIET, "stil" },
++    { BL_FLANK, "flank" }, { BL_FLANK, "go around" }, { BL_FLANK, "go round" }, { BL_FLANK, "go behind" }, { BL_FLANK, "behind them" }, { BL_FLANK, "lurk" },
++    { BL_WAIT, "wait" }, { BL_WAIT, "wait for me" }, { BL_WAIT, "hold on" }, { BL_WAIT, "not yet" }, { BL_WAIT, "wacht" }, { BL_WAIT, "attends" }, { BL_WAIT, "warte" }, { BL_WAIT, "slow down" },
++    { BL_FALLBACK, "fall back" }, { BL_FALLBACK, "fallback" }, { BL_FALLBACK, "back" }, { BL_FALLBACK, "back off" }, { BL_FALLBACK, "retreat" }, { BL_FALLBACK, "get back" }, { BL_FALLBACK, "get out" }, { BL_FALLBACK, "terug" }, { BL_FALLBACK, "save" },
++    { BL_LEAD, "lead" }, { BL_LEAD, "go first" }, { BL_LEAD, "you first" }, { BL_LEAD, "you go first" }, { BL_LEAD, "entry" }, { BL_LEAD, "take point" },
++    { BL_STACK, "stack" }, { BL_STACK, "all" }, { BL_STACK, "everyone to" }, { BL_STACK, "everyone" }, { BL_STACK, "all go" },
++    { BL_CANCEL, "cancel" }, { BL_CANCEL, "never mind" }, { BL_CANCEL, "nevermind" }, { BL_CANCEL, "nvm" }, { BL_CANCEL, "forget it" }, { BL_CANCEL, "as you were" }, { BL_CANCEL, "do your thing" },
++    { BL_CANCEL, "stop following" }, { BL_CANCEL, "free" }, { BL_CANCEL, "laat maar" },
++    { BL_HELP, "help" }, { BL_HELP, "help me" }, { BL_HELP, "need help" }, { BL_HELP, "need backup" }, { BL_HELP, "backup" }, { BL_HELP, "save me" }, { BL_HELP, "hulp" }, { BL_HELP, "aide" }, { BL_HELP, "hilfe" },
++
++    { BL_THANKS, "thanks" }, { BL_THANKS, "thank you" }, { BL_THANKS, "thx" }, { BL_THANKS, "ty" }, { BL_THANKS, "tyvm" }, { BL_THANKS, "cheers" }, { BL_THANKS, "merci" }, { BL_THANKS, "danke" }, { BL_THANKS, "bedankt" }, { BL_THANKS, "dank je" }, { BL_THANKS, "dankje" },
++    { BL_SORRY, "sorry" }, { BL_SORRY, "sry" }, { BL_SORRY, "my bad" }, { BL_SORRY, "mb" }, { BL_SORRY, "oops" }, { BL_SORRY, "pardon" }, { BL_SORRY, "desole" },
++    { BL_GREETING, "hi" }, { BL_GREETING, "hello" }, { BL_GREETING, "hey" }, { BL_GREETING, "yo" }, { BL_GREETING, "hallo" }, { BL_GREETING, "hoi" }, { BL_GREETING, "salut" }, { BL_GREETING, "bonjour" }, { BL_GREETING, "sup" }, { BL_GREETING, "hi all" }, { BL_GREETING, "hey all" }, { BL_GREETING, "goedenavond" }, { BL_GREETING, "moin" },
++    { BL_BYE, "bye" }, { BL_BYE, "cya" }, { BL_BYE, "bb" }, { BL_BYE, "gtg" }, { BL_BYE, "good night" }, { BL_BYE, "gn" }, { BL_BYE, "see you" }, { BL_BYE, "later" }, { BL_BYE, "doei" }, { BL_BYE, "a plus" }, { BL_BYE, "tschuss" }, { BL_BYE, "im off" },
++    { BL_GG, "gg" }, { BL_GG, "ggs" }, { BL_GG, "gg wp" }, { BL_GG, "good game" }, { BL_GG, "wp" }, { BL_GG, "ggwp" },
++    { BL_GLHF, "glhf" }, { BL_GLHF, "gl hf" }, { BL_GLHF, "gl" }, { BL_GLHF, "hf" }, { BL_GLHF, "good luck" }, { BL_GLHF, "have fun" }, { BL_GLHF, "succes" }, { BL_GLHF, "bonne chance" },
++    { BL_COMPLIMENT, "nice" }, { BL_COMPLIMENT, "nice shot" }, { BL_COMPLIMENT, "ns" }, { BL_COMPLIMENT, "gj" }, { BL_COMPLIMENT, "good job" }, { BL_COMPLIMENT, "well played" }, { BL_COMPLIMENT, "nice one" },
++    { BL_COMPLIMENT, "good bot" }, { BL_COMPLIMENT, "nice bot" }, { BL_COMPLIMENT, "well done" }, { BL_COMPLIMENT, "great" }, { BL_COMPLIMENT, "sick" }, { BL_COMPLIMENT, "goed gedaan" }, { BL_COMPLIMENT, "bien joue" },
++    { BL_INSULT, "noob" }, { BL_INSULT, "noobs" }, { BL_INSULT, "useless" }, { BL_INSULT, "stupid" }, { BL_INSULT, "dumb" }, { BL_INSULT, "trash" }, { BL_INSULT, "bad bot" }, { BL_INSULT, "stupid bot" }, { BL_INSULT, "stupid bots" },
++    { BL_INSULT, "useless bots" }, { BL_INSULT, "idiot" }, { BL_INSULT, "idiots" }, { BL_INSULT, "you suck" }, { BL_INSULT, "bots suck" }, { BL_INSULT, "so bad" }, { BL_INSULT, "dom" }, { BL_INSULT, "nul" },
++    { BL_BLAME, "your fault" }, { BL_BLAME, "why did you" }, { BL_BLAME, "what are you doing" }, { BL_BLAME, "wtf" }, { BL_BLAME, "you lost us" }, { BL_BLAME, "thanks for nothing" }, { BL_BLAME, "why" },
++    { BL_LAUGH, "lol" }, { BL_LAUGH, "haha" }, { BL_LAUGH, "hahaha" }, { BL_LAUGH, "lmao" }, { BL_LAUGH, "xd" }, { BL_LAUGH, "rofl" }, { BL_LAUGH, "hehe" },
++    { BL_NICE_TRY, "nt" }, { BL_NICE_TRY, "nice try" }, { BL_NICE_TRY, "unlucky" }, { BL_NICE_TRY, "unl" }, { BL_NICE_TRY, "so close" }, { BL_NICE_TRY, "jammer" }, { BL_NICE_TRY, "dommage" },
++};
++#define BOTLISTEN_TABLE ((int)(sizeof(botListenTable) / sizeof(botListenTable[0])))
++
++/* Lower-case, drop colour codes and punctuation, collapse spaces, pad with one space each side. */
++static int botListenClean(const char *in, char *out, int outLen)
++{
++    int n = 0; out[n++] = ' ';
++    for (const char *s = in; *s && n < outLen - 2; s++) {
++        unsigned char c = (unsigned char)*s;
++        if (c == '^' && s[1]) { s++; continue; }
++        if (c == '\'' || c == '`') continue;                          /* don't -> dont, what's -> whats */
++        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
++        if (c >= 0x80) {                                              /* fold the common accented letters (UTF-8 and Latin-1) */
++            if (c == 0xC3 && s[1]) { unsigned char d = (unsigned char)*++s; c = (d >= 0xA8 && d <= 0xAB) ? 'e' : (d >= 0xA0 && d <= 0xA5) ? 'a' : (d >= 0xB9 && d <= 0xBC) ? 'u' : (d >= 0xB2 && d <= 0xB6) ? 'o' : (d >= 0xAC && d <= 0xAF) ? 'i' : d == 0xA7 ? 'c' : ' '; }
++            else c = (c >= 0xE8 && c <= 0xEB) ? 'e' : (c >= 0xE0 && c <= 0xE5) ? 'a' : (c >= 0xF9 && c <= 0xFC) ? 'u' : (c >= 0xF2 && c <= 0xF6) ? 'o' : ' ';
++        }
++        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) c = ' ';
++        if (c == ' ' && out[n - 1] == ' ') continue;
++        out[n++] = (char)c;
++    }
++    if (out[n - 1] != ' ') out[n++] = ' ';
++    out[n] = 0;
++    return n;
++}
++
++/* Find " word " in the padded string; returns offset of the leading space or -1. */
++static int botListenFind(const char *hay, const char *phrase)
++{
++    char pat[64]; size_t l = strlen(phrase);
++    if (l + 3 > sizeof(pat)) return -1;
++    pat[0] = ' '; memcpy(pat + 1, phrase, l); pat[l + 1] = ' '; pat[l + 2] = 0;
++    const char *p = strstr(hay, pat);
++    return p ? (int)(p - hay) : -1;
++}
++static void botListenBlank(char *hay, int at, int len) { for (int i = at + 1; i < at + 1 + len; i++) hay[i] = '_'; }
++
++/* Parse one chat line. Returns 1 when it means something to the bots. */
++static int botListenParse(const char *text, const char *const *botNames, int numBots, const char *const *areaNames, int numAreas, botlisten_t *out)
++{
++    char msg[160], tmp[64];
++    out->intent = BL_NONE; out->addressed = BOTLISTEN_NONE; out->target = -1; out->area = -1; out->negated = 0;
++    if (!text || !*text) return 0;
++    int len = botListenClean(text, msg, sizeof(msg));
++    if (len < 3) return 0;
++    /* who is it for: a bot's name, or a group word */
++    int words = 0; for (int i = 1; msg[i]; i++) if (msg[i] == ' ') words++;
++    for (int b = 0; b < numBots; b++) {
++        if (!botNames[b] || !botNames[b][0]) continue;
++        botListenClean(botNames[b], tmp, sizeof(tmp));
++        size_t tl = strlen(tmp); if (tl < 4) continue;                /* " xy " at least two letters */
++        tmp[tl - 1] = 0;
++        int at = botListenFind(msg, tmp + 1);
++        if (at >= 0) { out->addressed = BOTLISTEN_NAMED; out->target = b; botListenBlank(msg, at, (int)tl - 2); break; }
++    }
++    if (out->addressed == BOTLISTEN_NONE) {
++        static const char *const grp[] = { "bots", "bot", "team", "guys", "everyone", "everybody", "all bots", "you all", "jongens", "tout le monde", "alle" };
++        for (int g = 0; g < (int)(sizeof(grp) / sizeof(grp[0])); g++) if (botListenFind(msg, grp[g]) >= 0) { out->addressed = BOTLISTEN_GROUP; break; }
++    }
++    /* which area: the longest area name that appears; a single letter or digit matches "Site A" style names */
++    int bestLen = 0, bestAt = -1;
++    for (int a = 0; a < numAreas; a++) {
++        if (!areaNames[a] || !areaNames[a][0]) continue;
++        botListenClean(areaNames[a], tmp, sizeof(tmp));
++        int tl = (int)strlen(tmp); if (tl < 3) continue;
++        tmp[tl - 1] = 0;
++        int at = botListenFind(msg, tmp + 1);
++        if (at >= 0 && tl - 2 > bestLen) { bestLen = tl - 2; bestAt = at; out->area = a; }
++    }
++    if (out->area < 0)
++        for (int a = 0; a < numAreas && out->area < 0; a++) {
++            if (!areaNames[a]) continue;
++            botListenClean(areaNames[a], tmp, sizeof(tmp));
++            int tl = (int)strlen(tmp);
++            if (tl >= 5 && tmp[tl - 3] == ' ') {                      /* name ends in one character: "site a", "tunnel 2" */
++                char one[2] = { tmp[tl - 2], 0 };
++                int at = botListenFind(msg, one);
++                /* only as the last word, so "take a look" is not Site A */
++                if (at >= 0 && msg[at + 3] == 0) { out->area = a; bestAt = at; bestLen = 1; }
++            }
++        }
++    if (bestAt >= 0) botListenBlank(msg, bestAt, bestLen);
++    /* negation */
++    static const char *const neg[] = { "dont", "do not", "stop", "no", "not", "niet", "ne pas", "nicht" };
++    for (int i = 0; i < (int)(sizeof(neg) / sizeof(neg[0])); i++) if (botListenFind(msg, neg[i]) >= 0) out->negated = 1;
++    /* intent: longest phrase wins, earlier table rows win ties */
++    int best = -1; size_t bl = 0;
++    for (int i = 0; i < BOTLISTEN_TABLE; i++) {
++        size_t l = strlen(botListenTable[i].phrase);
++        if (l > bl && botListenFind(msg, botListenTable[i].phrase) >= 0) { best = i; bl = l; }
++    }
++    if (best >= 0) out->intent = botListenTable[best].intent;
++    /* fix-ups */
++    if (out->intent == BL_GOTO && out->area < 0) out->intent = BL_PUSH;              /* "go" with no place is "go!" */
++    if (out->intent == BL_STACK && out->area < 0) out->intent = BL_REGROUP;          /* "everyone" with no place */
++    if ((out->intent == BL_PUSH || out->intent == BL_HOLD) && out->area >= 0 && botListenFind(msg, "all") >= 0) out->intent = BL_STACK;
++    if (out->intent == BL_NONE && out->area >= 0 && out->addressed != BOTLISTEN_NONE) out->intent = BL_GOTO;   /* "viper tunnel" */
++    if (out->intent == BL_NONE && out->addressed == BOTLISTEN_NAMED && words <= 1) out->intent = BL_NAME_ONLY;
++    if (out->intent == BL_NONE && out->addressed != BOTLISTEN_NONE && strchr(text, '?')) out->intent = BL_ASK_OTHER;
++    if (out->negated && BL_ORDER(out->intent)) {
++        if (out->intent == BL_PUSH || out->intent == BL_GOTO || out->intent == BL_LEAD || out->intent == BL_FLANK) out->intent = BL_WAIT;
++        else if (out->intent == BL_HOLD || out->intent == BL_WAIT || out->intent == BL_QUIET) out->intent = BL_PUSH;
++        else if (out->intent != BL_SPREAD && out->intent != BL_CANCEL) out->intent = BL_CANCEL;      /* "dont stack" is already spread */
++    }
++    /* Ordinary chat is full of words like "back", "take", "later" and "nice". When nobody is addressed, only a short
++     * line counts: an order without a place needs to be 4 words or fewer, a social line too. */
++    if (out->addressed == BOTLISTEN_NONE && words > 4 && ((BL_ORDER(out->intent) && out->area < 0) || BL_SOCIAL(out->intent))) out->intent = BL_NONE;
++    return out->intent != BL_NONE;
++}
++
++/* The phrase-bank situation a bot answers with. `can` = the bot can do it (has the grenade, is alive, is free). */
++static const char *botListenReplyKey(int intent, int can)
++{
++    switch (intent) {
++    case BL_FOLLOW: return can ? "order_follow" : "order_busy";
++    case BL_HOLD: return can ? "order_hold" : "order_busy";
++    case BL_PUSH: return can ? "order_push" : "order_busy";
++    case BL_GOTO: return can ? "order_goto" : "order_too_far";
++    case BL_REGROUP: return can ? "order_regroup" : "order_too_far";
++    case BL_COVER: return can ? "order_cover_me" : "order_too_far";
++    case BL_WATCH: return can ? "order_watch" : "order_busy";
++    case BL_SMOKE: return can ? "order_smoke" : "order_no_utility";
++    case BL_FLASH: return can ? "order_flash" : "order_no_utility";
++    case BL_FRAG: return can ? "order_frag" : "order_no_utility";
++    case BL_DROP_BOMB: return can ? "order_drop_bomb" : "ask_unknown_reply";
++    case BL_TAKE_BOMB: return can ? "order_take_bomb" : "order_too_far";
++    case BL_PLANT: return can ? "order_plant" : "order_busy";
++    case BL_DEFUSE: return can ? "order_defuse" : "order_busy";
++    case BL_SPREAD: return "order_spread";
++    case BL_QUIET: return "order_quiet";
++    case BL_FLANK: return can ? "order_flank" : "order_busy";
++    case BL_WAIT: return "order_wait";
++    case BL_FALLBACK: return "order_fallback";
++    case BL_LEAD: return can ? "order_lead" : "order_busy";
++    case BL_STACK: return can ? "order_stack" : "order_too_far";
++    case BL_CANCEL: return "ping_cancel";
++    case BL_HELP: return can ? "ping_help_ack" : "fu_cant_help";
++    case BL_ASK_STATUS: return "ask_status_reply";
++    case BL_ASK_COUNT: return can ? "ask_count_reply" : "ask_unknown_reply";
++    case BL_ASK_BOMB: return can ? "ask_bomb_reply" : "ask_unknown_reply";
++    case BL_ASK_BOT: return "reply_are_you_bot";
++    case BL_ASK_OTHER: return can ? "fu_answer_ask_info" : "reply_question_generic";
++    case BL_THANKS: return "reply_thanks";
++    case BL_SORRY: return "reply_sorry";
++    case BL_GREETING: return "reply_greeting";
++    case BL_BYE: return "reply_bye";
++    case BL_GG: return "reply_gg";
++    case BL_GLHF: return "reply_glhf";
++    case BL_COMPLIMENT: return "reply_compliment";
++    case BL_INSULT: return "reply_insult";
++    case BL_BLAME: return "reply_blame";
++    case BL_LAUGH: return "reply_laugh";
++    case BL_NICE_TRY: return "reply_nice_try";
++    case BL_NAME_ONLY: return "called_by_name";
++    default: return NULL;
++    }
++}
++
++#endif /* IXVO_BOT_LISTEN_H */
+diff --git a/true-combat/src/game/ixvo_bot_nav.c b/true-combat/src/game/ixvo_bot_nav.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..7dac93c1e90872588c55ebb739df35f0ce87b8a6
+--- /dev/null
++++ b/true-combat/src/game/ixvo_bot_nav.c
+@@ -0,0 +1,117 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++ * Standing and crouching walk graph adapted from TrueCombat: Platinum's native bot navigation.
++ * Store player origins and directed links in TCE2's existing waypoint graph.
++ */
++#include "g_local.h"
++#include "tce_nodes.h"
++
++extern vec3_t playerMins, playerMaxs, playerMinsNew, playerMaxsNew;
++static void WalkTrace(trace_t *tr, const vec3_t from, const vec3_t to, qboolean crouch)
++{
++	vec3_t maxs;
++	VectorCopy(g_newbbox.integer ? playerMaxsNew : playerMaxs, maxs);
++	if (crouch) maxs[2] -= g_newbbox.integer ? 26 : 21;
++	trap_Trace(tr, from, g_newbbox.integer ? playerMinsNew : playerMins, maxs, to, ENTITYNUM_NONE, MASK_PLAYERSOLID & ~CONTENTS_BODY);
++}
++
++static qboolean WalkStep(const vec3_t from, float dx, float dy, vec3_t out, qboolean crouch)
++{
++	const int steps = (int)ceilf(sqrtf(dx * dx + dy * dy) / 16.0f);
++	int i;
++	trace_t tr;
++	vec3_t pos, end, down;
++	VectorCopy(from, pos);
++	for (i = 0; i < steps; ++i)
++	{
++		VectorCopy(pos, end);
++		end[0] += dx / steps;
++		end[1] += dy / steps;
++		WalkTrace(&tr, pos, end, crouch);
++		if (tr.startsolid) return qfalse;
++		if (tr.fraction < 1.0f)
++		{
++			vec3_t up;
++			VectorCopy(pos, up);
++			up[2] += 18;
++			WalkTrace(&tr, pos, up, crouch);
++			if (tr.startsolid || tr.fraction < 1.0f) return qfalse;
++			end[2] = up[2];
++			WalkTrace(&tr, up, end, crouch);
++			if (tr.startsolid || tr.fraction < 1.0f) return qfalse;
++		}
++		VectorCopy(end, down);
++		down[2] -= 18 + (i == steps - 1 ? 160 : 24);
++		WalkTrace(&tr, end, down, crouch);
++		if (tr.startsolid || tr.allsolid || tr.fraction >= 1.0f || tr.plane.normal[2] < 0.7f) return qfalse;
++		VectorCopy(tr.endpos, pos);
++	}
++	VectorCopy(pos, out);
++	return qtrue;
++}
++
++static int NodeAt(const vec3_t p)
++{
++	static const short entities[3] = { ENTITYNUM_NONE, ENTITYNUM_NONE, ENTITYNUM_NONE };
++	int i;
++	for (i = 0; i < tceNumNodes; ++i)
++	{
++		vec3_t delta;
++		VectorSubtract(p, tceNodes[i].origin, delta);
++		/* Snapping a trace to a nearby cell across a thin wall makes a bad link. */
++		if (DotProduct(delta, delta) < 4.0f) return i;
++	}
++	return TCE_AddNode(p, 0, entities, 0) ? tceNumNodes - 1 : -1;
++}
++
++void IXVO_BuildWalkGraph(void)
++{
++	static const int dirs[8][2] = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{-1,1},{1,-1},{-1,-1}};
++	int i, j, edges = 0;
++	vec3_t start, end;
++	trace_t tr;
++	for (i = MAX_CLIENTS; i < level.num_entities; ++i)
++	{
++		const gentity_t *ent = &g_entities[i];
++		const char *c = ent->classname;
++		if (!ent->inuse || !c) continue;
++		if (ent->s.eType == ET_OID_TRIGGER && ent->r.linked)
++		{
++			VectorAdd(ent->r.absmin, ent->r.absmax, start);
++			VectorScale(start, .5f, start);
++		}
++		else if (Q_stricmp(c, "team_CTF_redspawn") && Q_stricmp(c, "team_CTF_bluespawn") &&
++		    Q_stricmp(c, "team_CTF_redplayer") && Q_stricmp(c, "team_CTF_blueplayer") && Q_stricmp(c, "info_player_deathmatch")) continue;
++		else VectorCopy(ent->s.pos.trBase, start);
++		/* Align seeds to one lattice where collision allows, so spawn clusters join. */
++		start[0] = floorf(start[0] / 64.0f + 0.5f) * 64;
++		start[1] = floorf(start[1] / 64.0f + 0.5f) * 64;
++		start[2] += 24;
++		VectorCopy(start, end);
++		end[2] -= 300;
++		WalkTrace(&tr, start, end, qfalse);
++		if (!tr.startsolid && !tr.allsolid && tr.fraction < 1 && tr.plane.normal[2] >= 0.7f) NodeAt(tr.endpos);
++	}
++	for (i = 0; i < tceNumNodes; ++i)
++	{
++		for (j = 0; j < 8; ++j)
++		{
++			vec3_t waist;
++			int to;
++			qboolean crouch = qfalse;
++			if (!WalkStep(tceNodes[i].origin, 64 * dirs[j][0], 64 * dirs[j][1], end, qfalse))
++			{
++				crouch = qtrue;
++				if (!WalkStep(tceNodes[i].origin, 64 * dirs[j][0], 64 * dirs[j][1], end, qtrue)) continue;
++			}
++			VectorCopy(end, waist);
++			waist[2] += 8;
++			if (trap_PointContents(waist, ENTITYNUM_NONE) & MASK_WATER) continue;
++			to = NodeAt(end);
++			if (to >= 0 && to != i && TCE_ConnectNodes(i, to, crouch ? 1 : 0)) ++edges;
++		}
++	}
++	/* Distribute patrol goals across the generated graph for TCE2's native goal picker. */
++	for (i = 0; i < tceNumNodes; i += 17)
++		if (tceNodes[i].numLinks > 1) tceNodes[i].flags |= 0x200;
++	G_Printf("IXVO walk graph: %d nodes, %d directed links\n", tceNumNodes, edges);
++}
+diff --git a/true-combat/src/game/ixvo_bots.c b/true-combat/src/game/ixvo_bots.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..72723b317396139805ff4d2d3649d08fd142cfb9
+--- /dev/null
++++ b/true-combat/src/game/ixvo_bots.c
+@@ -0,0 +1,626 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++ * TrueCombat: Platinum bot skills, orders, chat and server fill adapted to
++ * TCE2's native bot movement, combat, teams, and waypoint state machine.
++ */
++#include "g_local.h"
++#include "tce_botinfo.h"
++#include "tce_nodes.h"
++#include "tce_node_editor.h"
++#ifdef FEATURE_OMNIBOT
++#include "g_etbot_interface.h"
++#endif
++#include "ixvo_bot_chat.h"
++#include "ixvo_bot_listen.h"
++
++typedef struct {
++	qboolean active, fill;
++	int standinUntil;
++	int patrolGoal, patrolCount;
++	char ownerGuid[40];
++	int skill, enemy, seenAt, shotAt, driftAt, aimAt;
++	int leader, order, orderUntil, goalEntity, goalNode, goalAt, nextTap, fireUntil, pauseUntil;
++	float yaw, pitch, wantYaw, wantPitch;
++} ixvoBot_t;
++
++typedef struct {
++	int team, playerClass, primary, secondary, utility;
++	char guid[40];
++} ixvoVacancy_t;
++
++static ixvoVacancy_t vacancies[MAX_CLIENTS];
++static ixvoBot_t roster[MAX_CLIENTS];
++static int nextFill, nextName;
++static int lastVisit[2][TCE_MAX_NODES], reservedUntil[2][TCE_MAX_NODES];
++static const char *const names[] = { "Rook", "Iris", "Flint", "Ash", "Mica", "Alder", "Lynx", "Vale" };
++
++qboolean IXVO_BotsEnabled(void)
++{
++#ifdef FEATURE_OMNIBOT
++	if (g_OmniBotEnable.integer) return qfalse;
++#endif
++	return ixvo_bots.integer != 0;
++}
++
++qboolean IXVO_IsBot(int slot)
++{
++	return slot >= 0 && slot < MAX_CLIENTS && roster[slot].active;
++}
++
++static int ClampSkill(int skill)
++{
++	return skill < 1 ? 1 : skill > 5 ? 5 : skill;
++}
++
++void IXVO_RestoreBot(int slot, const char *info)
++{
++	ixvoBot_t *b = &roster[slot];
++	TCE_ClearBotInfo(slot);
++	memset(b, 0, sizeof(*b));
++	b->active = qtrue;
++	b->patrolGoal = -1;
++	b->fill = atoi(Info_ValueForKey(info, "ixvo_fill")) != 0;
++	b->skill = ClampSkill(atoi(Info_ValueForKey(info, "skill")));
++	b->enemy = b->leader = b->goalEntity = b->goalNode = -1;
++	tceBotInfo[slot].skill = b->skill;
++}
++
++qboolean IXVO_BotKeepsLoadout(int slot)
++{
++	return IXVO_IsBot(slot) && roster[slot].standinUntil != 0;
++}
++
++void IXVO_ForgetBot(int slot)
++{
++	int i;
++	gentity_t *ent = &g_entities[slot];
++	gclient_t *c = ent->client;
++	if (IXVO_BotsEnabled() && ixvo_botStandin.integer && g_gamestate.integer == GS_PLAYING && !level.restarted &&
++	    !level.intermissiontime && !(ent->r.svFlags & SVF_BOT) && c && c->pers.connected == CON_CONNECTED &&
++	    (c->sess.sessionTeam == TEAM_AXIS || c->sess.sessionTeam == TEAM_ALLIES))
++	{
++		char info[MAX_INFO_STRING];
++		ixvoVacancy_t *v = &vacancies[slot];
++		v->team = c->sess.sessionTeam;
++		v->playerClass = c->sess.playerType;
++		v->primary = c->sess.playerWeapon;
++		v->secondary = c->sess.playerWeapon2;
++		v->utility = c->sess.playerWeapon3;
++		trap_GetUserinfo(slot, info, sizeof(info));
++		Q_strncpyz(v->guid, Info_ValueForKey(info, "cl_guid"), sizeof(v->guid));
++	}
++	botChatCancel(slot, -1);
++	memset(&roster[slot], 0, sizeof(roster[slot]));
++	for (i = 0; i < MAX_CLIENTS; ++i)
++	{
++		if (roster[i].leader == slot) roster[i].order = BL_NONE;
++		if (roster[i].enemy == slot) roster[i].enemy = -1;
++	}
++}
++
++void IXVO_InitBots(int seed)
++{
++	fileHandle_t file = 0;
++	int length, loaded = 0;
++	char *data;
++	nextName = 0;
++	memset(lastVisit, 0, sizeof(lastVisit));
++	memset(reservedUntil, 0, sizeof(reservedUntil));
++	nextFill = level.time + 1000;
++	memset(roster, 0, sizeof(roster));
++	memset(vacancies, 0, sizeof(vacancies));
++	botChat.loaded = 0;
++	botChatRoundReset();
++	botChat.seed = (unsigned)seed;
++	length = trap_FS_FOpenFile("bots/ixvo_phrases.txt", &file, FS_READ);
++	if (file)
++	{
++		if (length > 0 && length < 1024 * 1024 && (data = malloc((size_t)length + 1)) != NULL)
++		{
++			trap_FS_Read(data, length, file);
++			data[length] = 0;
++			loaded = botChatLoad(data, length);
++			free(data);
++		}
++		trap_FS_FCloseFile(file);
++	}
++	G_Printf("IXVO bots: %d chat phrases loaded\n", loaded > 0 ? loaded : 0);
++}
++
++static int AddBot(int skill, char *team, const char *name, qboolean fill, const ixvoVacancy_t *vacancy)
++{
++	char info[MAX_INFO_STRING] = "", generated[MAX_NAME_LENGTH];
++	const char *reason;
++	gentity_t *ent;
++	int slot = trap_BotAllocateClient(0);
++	if (slot < 0)
++	{
++		G_Printf("IXVO: no free bot slot\n");
++		return -1;
++	}
++	if (!name || !*name)
++	{
++		const int count = sizeof(names) / sizeof(names[0]);
++		Com_sprintf(generated, sizeof(generated), "%s%d", names[nextName % count], nextName / count + 1);
++		name = generated;
++		nextName++;
++	}
++	if (!Q_stricmp(team, "auto"))
++		team = PickTeam(slot) == TEAM_AXIS ? "red" : "blue";
++	Info_SetValueForKey(info, "name", name);
++	Info_SetValueForKey(info, "ixvo_bot", "1");
++	Info_SetValueForKey(info, "ixvo_fill", fill ? "1" : "0");
++	Info_SetValueForKey(info, "skill", va("%d", ClampSkill(skill)));
++	Info_SetValueForKey(info, "team", team);
++	Info_SetValueForKey(info, "rate", "25000");
++	Info_SetValueForKey(info, "snaps", "20");
++	trap_SetUserinfo(slot, info);
++	reason = ClientConnect(slot, qtrue, qtrue);
++	if (reason)
++	{
++		G_Printf("IXVO: bot rejected: %s\n", reason);
++		IXVO_ForgetBot(slot);
++		trap_BotFreeClient(slot);
++		return -1;
++	}
++	ent = &g_entities[slot];
++	if (vacancy)
++	{
++		int seconds = ixvo_botStandinTime.integer;
++		seconds = seconds < 1 ? 1 : seconds > 3600 ? 3600 : seconds;
++		roster[slot].standinUntil = level.time + seconds * 1000;
++		Q_strncpyz(roster[slot].ownerGuid, vacancy->guid, sizeof(roster[slot].ownerGuid));
++		ent->client->sess.latchPlayerType = vacancy->playerClass;
++		ent->client->sess.latchPlayerWeapon = vacancy->primary;
++		ent->client->sess.latchPlayerWeapon2 = vacancy->secondary;
++		ent->client->sess.latchPlayerWeapon3 = vacancy->utility;
++	}
++	/* Force a genuine team transition, which also runs TCE2's ClientBegin. */
++	ent->client->sess.sessionTeam = TEAM_SPECTATOR;
++	if (!SetTeam(ent, team, qtrue, -1, -1, -1, qfalse))
++	{
++		trap_DropClient(slot, "Could not join a team", 0);
++		return -1;
++	}
++	G_Printf("IXVO: added %s (slot %d, skill %d, %s)\n", ent->client->pers.netname, slot, roster[slot].skill, team);
++	return slot;
++}
++
++qboolean IXVO_BotCommand(const char *cmd)
++{
++	char skill[8], team[16], name[MAX_NAME_LENGTH];
++	int i;
++	if (Q_stricmp(cmd, "ixvo_addbot") && Q_stricmp(cmd, "ixvo_kickbot") && Q_stricmp(cmd, "ixvo_botstatus"))
++		return qfalse;
++	if (!IXVO_BotsEnabled())
++	{
++		G_Printf("Set ixvo_bots 1, omnibot_enable 0 and restart the map.\n");
++		return qtrue;
++	}
++	if (!Q_stricmp(cmd, "ixvo_addbot"))
++	{
++		trap_Argv(1, skill, sizeof(skill));
++		trap_Argv(2, team, sizeof(team));
++		trap_Argv(3, name, sizeof(name));
++		if (!*team) Q_strncpyz(team, "auto", sizeof(team));
++		if (trap_Argc() > 4 || (*skill && (strlen(skill) != 1 || *skill < '1' || *skill > '5')) ||
++		    (Q_stricmp(team, "auto") && Q_stricmp(team, "red") && Q_stricmp(team, "blue")))
++			G_Printf("ixvo_addbot [1-5] [auto|red|blue] [name]\n");
++		else AddBot(*skill ? atoi(skill) : 3, team, name, qfalse, NULL);
++		return qtrue;
++	}
++	trap_Argv(1, name, sizeof(name));
++	for (i = 0; i < level.maxclients; ++i)
++	{
++		if (!IXVO_IsBot(i)) continue;
++		if (!Q_stricmp(cmd, "ixvo_botstatus"))
++			G_Printf("IXVO slot %d: %s, team %d, skill %d, health %d, origin %.0f %.0f %.0f, patrols %d, last patrol node %d\n", i,
++			         level.clients[i].pers.netname, level.clients[i].sess.sessionTeam, roster[i].skill,
++			         g_entities[i].health, level.clients[i].ps.origin[0], level.clients[i].ps.origin[1], level.clients[i].ps.origin[2],
++			         roster[i].patrolCount, roster[i].patrolGoal);
++		else if (!Q_stricmp(name, "all") || !Q_stricmp(name, va("%d", i)) || !Q_stricmp(name, level.clients[i].pers.netname))
++			trap_DropClient(i, "Bot removed", 0);
++	}
++	return qtrue;
++}
++
++void IXVO_BotTeamJoined(gentity_t *ent)
++{
++	int i, release = -1;
++	char info[MAX_INFO_STRING], guid[40];
++	int team = ent->client->sess.sessionTeam;
++	if (!IXVO_BotsEnabled() || !ixvo_botStandin.integer || ent->r.svFlags & SVF_BOT ||
++	    (team != TEAM_AXIS && team != TEAM_ALLIES)) return;
++	trap_GetUserinfo(ent->s.number, info, sizeof(info));
++	Q_strncpyz(guid, Info_ValueForKey(info, "cl_guid"), sizeof(guid));
++	for (i = 0; i < level.maxclients; ++i)
++	{
++		if (vacancies[i].team && (vacancies[i].team == team || (*guid && !Q_stricmp(guid, vacancies[i].guid))))
++		{
++			memset(&vacancies[i], 0, sizeof(vacancies[i]));
++			return;
++		}
++		if (!roster[i].standinUntil) continue;
++		if (*guid && !Q_stricmp(guid, roster[i].ownerGuid)) { release = i; break; }
++		if (release < 0 && level.clients[i].sess.sessionTeam == team) release = i;
++	}
++	if (release >= 0) trap_DropClient(release, "Player took the stand-in's place", 0);
++}
++
++static void Emit(int slot, int team, int channel, int sit, const char *text)
++{
++	gentity_t *ent = &g_entities[slot];
++	(void)channel;
++	(void)sit;
++	if (ixvo_botChat.integer && IXVO_IsBot(slot) && ent->client && ent->client->sess.sessionTeam == team &&
++	    !ent->client->sess.muted && ent->health > 0)
++		G_Say(ent, NULL, SAY_TEAM, text);
++}
++
++void IXVO_BotFrame(void)
++{
++	int i, occupied = 0, lastFill = -1, target = ixvo_botMinPlayers.integer;
++	botChatFrame(level.time, Emit);
++	if (level.time < nextFill) return;
++	nextFill = level.time + 1000;
++	for (i = 0; i < level.maxclients; ++i)
++	{
++		if (level.clients[i].pers.connected != CON_DISCONNECTED) ++occupied;
++		if (roster[i].standinUntil && (level.time >= roster[i].standinUntil || !ixvo_botStandin.integer))
++		{
++			roster[i].standinUntil = 0;
++			roster[i].fill = qtrue;
++		}
++		if (roster[i].active && roster[i].fill && !roster[i].standinUntil) lastFill = i;
++	}
++	for (i = 0; i < level.maxclients; ++i)
++	{
++		ixvoVacancy_t *v = &vacancies[i];
++		if (!v->team) continue;
++		if (ixvo_botStandin.integer && occupied < level.maxclients - 1 && g_gamestate.integer == GS_PLAYING)
++		{
++			/* Mark as fill in userinfo so a map change releases its reservation. */
++			if (AddBot(3, v->team == TEAM_AXIS ? "red" : "blue", NULL, qtrue, v) >= 0) occupied++;
++		}
++		memset(v, 0, sizeof(*v));
++	}
++	if (target >= level.maxclients) target = level.maxclients - 1;
++	if (lastFill >= 0 && occupied > target) trap_DropClient(lastFill, "Adjusting bot fill", 0);
++	else if (occupied < target) AddBot(3, "auto", NULL, qtrue, NULL);
++}
++
++void IXVO_BotListen(gentity_t *human, const char *text)
++{
++	botlisten_t heard;
++	botchat_ctx_t ctx = {0};
++	const char *namesBySlot[MAX_CLIENTS] = {0}, *key;
++	int i, chosen = -1, speaker = (int)(human - g_entities);
++	if (!IXVO_BotsEnabled() || human->health <= 0 || human->client->sess.muted) return;
++	for (i = 0; i < level.maxclients; ++i)
++	{
++		gentity_t *bot = &g_entities[i];
++		if (!IXVO_IsBot(i) || bot->health <= 0 || !OnSameTeam(human, bot) ||
++		    COM_BitCheck(bot->client->sess.ignoreClients, speaker)) continue;
++		namesBySlot[i] = bot->client->pers.netname;
++		if (chosen < 0 || DistanceSquared(bot->r.currentOrigin, human->r.currentOrigin) <
++		    DistanceSquared(g_entities[chosen].r.currentOrigin, human->r.currentOrigin)) chosen = i;
++	}
++	if (chosen < 0 || !botListenParse(text, namesBySlot, level.maxclients, NULL, 0, &heard)) return;
++	if (heard.target >= 0) chosen = heard.target;
++	key = botListenReplyKey(heard.intent, 0);
++	if (BL_ORDER(heard.intent))
++	{
++		if (heard.addressed == BOTLISTEN_NONE) return;
++		if (heard.negated || heard.intent == BL_CANCEL)
++		{
++			roster[chosen].order = BL_NONE;
++			key = "ping_cancel";
++		}
++		else if (heard.intent == BL_DROP_BOMB)
++			key = botListenReplyKey(heard.intent, G_TCEManualDropBomb(&g_entities[chosen]));
++		else if (heard.intent == BL_HOLD || heard.intent == BL_WAIT || heard.intent == BL_FOLLOW || heard.intent == BL_REGROUP)
++		{
++			roster[chosen].order = heard.intent;
++			roster[chosen].leader = speaker;
++			roster[chosen].orderUntil = level.time + 15000;
++			key = botListenReplyKey(heard.intent, 1);
++		}
++		else key = "order_busy";
++	}
++	ctx.name = human->client->pers.netname;
++	if (ixvo_botChat.integer && key) botChatSay(level.time, chosen, human->client->sess.sessionTeam,
++	    chosen % BOTCHAT_PERS, botChatSituation(key), &ctx, BOTCHAT_FORCE);
++}
++
++qboolean IXVO_BotOrderMove(gentity_t *ent, usercmd_t *cmd)
++{
++	ixvoBot_t *b = &roster[ent->s.number];
++	gentity_t *leader;
++	vec3_t direction;
++	if (!b->active || !b->order) return qfalse;
++	leader = &g_entities[b->leader];
++	if (level.time >= b->orderUntil || ent->health <= 0 || !leader->inuse || leader->health <= 0 || !OnSameTeam(ent, leader))
++	{
++		b->order = BL_NONE;
++		return qfalse;
++	}
++	if (TCE_LocateEnemy(ent) && ent->enemy->health > 0 && TCE_MyVisible(ent, ent->enemy))
++		TCE_AttackEnemy(ent, cmd);
++	else if (b->order == BL_FOLLOW || b->order == BL_REGROUP)
++	{
++		VectorSubtract(leader->r.currentOrigin, ent->r.currentOrigin, direction);
++		vectoangles(direction, ent->s.angles);
++		if (VectorLength(direction) > 140 && TCE_CanMove(ent, 1) == 1) TCE_BotMove(ent, cmd, 1, 0);
++	}
++	return qtrue;
++}
++
++/* Platinum skill tables: first-shot reaction, target tracking lag and settling time. */
++static const int reaction[] = {0, 900, 650, 450, 300, 190};
++static const int trackLag[] = {0, 210, 160, 120, 85, 55};
++static const int settle[] = {0, 460, 360, 270, 200, 140};
++static const float aimError[] = {0, 6.5f, 4.2f, 2.6f, 1.6f, .9f};
++
++void IXVO_TrackTarget(gentity_t *ent, vec3_t target)
++{
++	ixvoBot_t *b = &roster[ent->s.number];
++	const int enemy = ent->enemy->s.number, skill = b->skill;
++	vec3_t delta, angles;
++	float weight;
++	VectorMA(target, -0.001f * trackLag[skill], ent->enemy->client->ps.velocity, target);
++	VectorSubtract(target, ent->r.currentOrigin, delta);
++	vectoangles(delta, angles);
++	if (enemy != b->enemy || level.time - b->seenAt > 350)
++	{
++		char area[64];
++		botchat_ctx_t ctx = {0};
++		if (ixvo_botChat.integer && Team_GetLocationMsg(ent->enemy, area, sizeof(area)))
++		{
++			ctx.area = area;
++			botChatSay(level.time, ent->s.number, ent->client->sess.sessionTeam, ent->s.number % BOTCHAT_PERS,
++			           botChatSituation("contact_one"), &ctx, 0);
++		}
++		float off = fabsf(AngleNormalize180(angles[YAW] - ent->client->ps.viewangles[YAW]));
++		float scale = off < 15 ? .72f : off > 60 ? 1.25f : 1.0f;
++		b->enemy = enemy;
++		b->shotAt = level.time + (int)(reaction[skill] * scale * (.85f + .30f * random()));
++		b->yaw = crandom() * aimError[skill];
++		b->pitch = crandom() * aimError[skill] * .5f;
++		b->driftAt = 0;
++	}
++	if (level.time >= b->driftAt)
++	{
++		float length = VectorLength(delta);
++		const float *v = ent->enemy->client->ps.velocity;
++		float lateral = fabsf(v[0] * delta[1] - v[1] * delta[0]) / (length > 1 ? length : 1);
++		b->wantYaw = crandom() * aimError[skill] * (1 + lateral / 160);
++		b->wantPitch = crandom() * aimError[skill] * .6f;
++		b->driftAt = level.time + 400 + rand() % 500;
++	}
++	weight = fminf(1, (level.time - b->aimAt) / (float)settle[skill]);
++	b->yaw += (b->wantYaw - b->yaw) * weight;
++	b->pitch += (b->wantPitch - b->pitch) * weight;
++	b->aimAt = b->seenAt = level.time;
++	angles[YAW] += b->yaw;
++	angles[PITCH] += b->pitch;
++	weight = VectorLength(delta);
++	AngleVectors(angles, delta, NULL, NULL);
++	VectorMA(ent->r.currentOrigin, weight, delta, target);
++}
++
++qboolean IXVO_BotReadyToFire(gentity_t *ent)
++{
++	trace_t tr;
++	vec3_t from, to;
++	if (level.time < roster[ent->s.number].shotAt) return qfalse;
++	VectorCopy(ent->r.currentOrigin, from);
++	from[2] += ent->client->ps.viewheight;
++	AngleVectors(ent->s.angles, to, NULL, NULL);
++	VectorMA(from, Distance(from, ent->enemy->r.currentOrigin), to, to);
++	trap_Trace(&tr, from, NULL, NULL, to, ent->s.number, MASK_SHOT);
++	if (tr.entityNum >= 0 && tr.entityNum < MAX_CLIENTS && g_entities[tr.entityNum].client &&
++	    OnSameTeam(ent, &g_entities[tr.entityNum])) return qfalse;
++	if (!ent->client->ps.ammoclip[BG_FindClipForWeapon(ent->client->ps.weapon)]) return qtrue; /* reload */
++	ixvoBot_t *b = &roster[ent->s.number];
++	if (ent->client->ps.persistant[10] != 0) /* native burst or semi-auto */
++	{
++		static const int tap[] = {0, 330, 270, 210, 170, 135};
++		if (level.time < b->nextTap) return qfalse;
++		b->nextTap = level.time + tap[b->skill] + rand() % 80;
++		return qtrue;
++	}
++	if (level.time < b->pauseUntil) return qfalse;
++	if (!b->fireUntil)
++	{
++		float dist = Distance(from, ent->enemy->r.currentOrigin);
++		b->fireUntil = level.time + (dist > 900 ? 180 : dist > 450 ? 300 : 650) + rand() % 150;
++	}
++	if (level.time < b->fireUntil) return qtrue;
++	b->fireUntil = 0;
++	b->pauseUntil = level.time + 160 + rand() % 220 + (6 - b->skill) * 40;
++	return qfalse;
++}
++
++/* Map Platinum's carry/defuse/escort roles to TCE2's live objective entities.
++ * The normal player cursor hint, hold timer and weapon event complete each action.
++ */
++static qboolean LiveCharge(const gentity_t *e)
++{
++	return e->inuse && (e->s.eType == ET_MISSILE || e->s.eType == 35) &&
++	       e->s.weapon == 15 && e->methodOfDeath == MOD_DYNAMITE && e->health < 248;
++}
++
++static void ObjectivePoint(const gentity_t *e, vec3_t point)
++{
++	if (e->s.eType == ET_OID_TRIGGER)
++	{
++		VectorAdd(e->r.absmin, e->r.absmax, point);
++		VectorScale(point, .5f, point);
++	}
++	else VectorCopy(e->r.currentOrigin, point);
++}
++
++static int FindObjective(gentity_t *ent)
++{
++	const int team = ent->client->sess.sessionTeam;
++	const int enemyFlag = team == TEAM_AXIS ? ALLIED_OBJECTIVE : AXIS_OBJECTIVE;
++	float nearest = 0;
++	int i, best = -1;
++	if (level.tceBombPlanted)
++	{
++		for (i = MAX_CLIENTS; i < level.num_entities; ++i)
++			if (LiveCharge(&g_entities[i]) && g_entities[i].s.teamNum != team) return i;
++	}
++	if (g_gametype.integer == 5 && !level.tceBombPlanted && level.tceBombAssigned &&
++	    level.tceBombCarrier >= 0 && level.tceBombCarrier < level.maxclients && level.tceBombCarrier != ent->s.number)
++	{
++		gentity_t *carrier = &g_entities[level.tceBombCarrier];
++		if (carrier->inuse && carrier->client && carrier->health > 0 && OnSameTeam(ent, carrier))
++			return level.tceBombCarrier;
++	}
++	for (i = MAX_CLIENTS; i < level.num_entities; ++i)
++	{
++		gentity_t *e = &g_entities[i];
++		vec3_t p;
++		float distance;
++		if (!e->inuse || !e->r.linked || e->s.eType != ET_OID_TRIGGER ||
++		    !e->target_ent || !e->target_ent->inuse ||
++		    !(e->spawnflags & (ALLIED_OBJECTIVE | AXIS_OBJECTIVE))) continue;
++		if (e->target_ent->s.eType != ET_EXPLOSIVE && !(g_gametype.integer == 2 && e->target_ent->s.eType == 65)) continue;
++		if (g_gametype.integer == 2 && !(e->spawnflags & enemyFlag)) continue;
++		ObjectivePoint(e, p);
++		distance = DistanceSquared(ent->r.currentOrigin, p);
++		if (best < 0 || distance < nearest) { best = i; nearest = distance; }
++	}
++	return best;
++}
++
++int IXVO_GoalNode(gentity_t *ent)
++{
++	ixvoBot_t *b = &roster[ent->s.number];
++	gentity_t *goal;
++	vec3_t p;
++	int n;
++	if (!tceNumNodes || (g_gametype.integer != 2 && g_gametype.integer != 5) ||
++	    g_gamestate.integer != GS_PLAYING || ent->client->ps.powerups[PW_REDFLAG] ||
++	    ent->client->ps.powerups[PW_BLUEFLAG]) return -1;
++	if (level.time < b->goalAt) return b->goalNode;
++	b->goalEntity = FindObjective(ent);
++	b->goalAt = level.time + 1500;
++	b->goalNode = -1;
++	if (b->goalEntity < 0) return -1;
++	goal = &g_entities[b->goalEntity];
++	ObjectivePoint(goal, p);
++	if (goal->s.eType == ET_OID_TRIGGER)
++	{
++		float nearest = 0;
++		for (n = 0; n < tceNumNodes; ++n)
++		{
++			const tceNode_t *node = &tceNodes[n];
++			const float *v = node->origin;
++			float d;
++			if (!node->numLinks || v[0] < goal->r.absmin[0] || v[0] > goal->r.absmax[0] ||
++			    v[1] < goal->r.absmin[1] || v[1] > goal->r.absmax[1] ||
++			    v[2] + 40 < goal->r.absmin[2] || v[2] - 24 > goal->r.absmax[2]) continue;
++			d = DistanceSquared(v, p);
++			if (b->goalNode < 0 || d < nearest) { b->goalNode = n; nearest = d; }
++		}
++	}
++	if (b->goalNode < 0) b->goalNode = TCE_FindClosestNodeToPoint(ent, p);
++	return b->goalNode;
++}
++
++qboolean IXVO_ObjectiveMove(gentity_t *ent, usercmd_t *cmd)
++{
++	ixvoBot_t *b = &roster[ent->s.number];
++	int hint;
++	gentity_t *goal;
++	vec3_t p, eye, d;
++	if (!b->active || ent->health <= 0 || g_gamestate.integer != GS_PLAYING) return qfalse;
++	hint = ent->client->ps.serverCursorHint;
++	if (hint == HINT_DISARM || hint == HINT_BREAKABLE_DYNAMITE ||
++	    (hint == HINT_ACTIVATE && ent->client->tceObjectiveContact))
++	{
++		cmd->buttons |= BUTTON_ACTIVATE;
++		return qtrue;
++	}
++	if (b->goalEntity < MAX_CLIENTS || b->goalEntity >= level.num_entities) return qfalse;
++	goal = &g_entities[b->goalEntity];
++	if (!goal->inuse || (goal->s.eType != ET_OID_TRIGGER && !LiveCharge(goal))) return qfalse;
++	if (goal->s.eType == ET_OID_TRIGGER && !(goal->spawnflags &
++	    (ent->client->sess.sessionTeam == TEAM_AXIS ? ALLIED_OBJECTIVE : AXIS_OBJECTIVE))) return qfalse;
++	if (goal->s.eType == ET_OID_TRIGGER && goal->target_ent && goal->target_ent->inuse)
++	{
++		VectorAdd(goal->target_ent->r.absmin, goal->target_ent->r.absmax, p);
++		VectorScale(p, .5f, p);
++	}
++	else ObjectivePoint(goal, p);
++	VectorCopy(ent->r.currentOrigin, eye);
++	eye[2] += ent->client->ps.viewheight;
++	VectorSubtract(p, eye, d);
++	if (VectorLength(d) > 88) return qfalse;
++	vectoangles(d, ent->s.angles);
++	if (TCE_CanMove(ent, 1) == 1) TCE_BotMove(ent, cmd, 1, 0);
++	return qtrue;
++}
++
++/* Adapt Platinum's least-visited-of-twelve patrols to TCE2's directed graph. */
++void IXVO_VisitNode(gentity_t *ent, int node)
++{
++	const int team = ent->client->sess.sessionTeam;
++	if (!ixvo_botExplore.integer || node < 0 || node >= tceNumNodes ||
++	    (team != TEAM_AXIS && team != TEAM_ALLIES)) return;
++	if (DistanceSquared(ent->r.currentOrigin, tceNodes[node].origin) <= 96 * 96)
++		lastVisit[team == TEAM_ALLIES][node] = level.time;
++}
++
++int IXVO_PatrolGoal(gentity_t *ent)
++{
++	short queue[TCE_MAX_NODES];
++	byte seen[TCE_MAX_NODES] = {0};
++	const int team = ent->client->sess.sessionTeam;
++	const int side = team == TEAM_ALLIES;
++	const int forbidden = side ? 0x20 : 0x10;
++	int head = 0, count = 0, draws, i, best = -1, bestScore = 0;
++	int start;
++
++	if (team != TEAM_AXIS && team != TEAM_ALLIES) return -1;
++	start = TCE_BotFindClosestNode(ent);
++	if (start < 0 || start >= tceNumNodes) return -1;
++	queue[count++] = (short)start;
++	seen[start] = 1;
++	while (head < count)
++	{
++		const tceNode_t *node = &tceNodes[queue[head++]];
++		for (i = 0; i < node->numLinks && i < TCE_MAX_NODE_LINKS; ++i)
++		{
++			const int next = node->links[i].target;
++			if (next < 0 || next >= tceNumNodes || seen[next] || (node->links[i].flags & 0x10) ||
++			    (tceNodes[next].flags & forbidden) || tceNodes[next].flags == -1) continue;
++			seen[next] = 1;
++			queue[count++] = (short)next;
++		}
++	}
++	/* Sample without replacement. Index zero is the starting node. */
++	draws = count - 1 < 12 ? count - 1 : 12;
++	for (i = 0; i < draws; ++i)
++	{
++		int pick = 1 + rand() % (count - 1);
++		int node = queue[pick];
++		int score = lastVisit[side][node];
++		queue[pick] = queue[--count];
++		if (reservedUntil[side][node] > level.time) score = reservedUntil[side][node];
++		if (best < 0 || score < bestScore)
++		{
++			best = node;
++			bestScore = score;
++		}
++	}
++	if (best >= 0)
++	{
++		ixvoBot_t *bot = &roster[ent->s.number];
++		reservedUntil[side][best] = level.time + 10000;
++		bot->patrolGoal = best;
++		++bot->patrolCount;
++	}
++	return best;
++}
+diff --git a/true-combat/src/game/tce_botinfo.c b/true-combat/src/game/tce_botinfo.c
+index 63c4c9ea1ceda6e68236c81868956e0178789e8d..12fa07993e2a29efc500fa684904e1e9d6f9c4e3 100644
+--- a/true-combat/src/game/tce_botinfo.c
++++ b/true-combat/src/game/tce_botinfo.c
+@@ -732,7 +732,11 @@ void TCE_FaceEnemy(gentity_t *ent)
+ 	{
+ 		point[2] -= 24.0f;
+ 	}
+-	if (skill >= 0 && skill <= 2)
++	if (IXVO_IsBot(ent->s.number))
++	{
++		IXVO_TrackTarget(ent, point);
++	}
++	else if (skill >= 0 && skill <= 2)
+ 	{
+ 		for (axis = 0; axis < 3; ++axis)
+ 		{
+@@ -771,6 +775,7 @@ void TCE_AttackEnemy(gentity_t *ent, usercmd_t *command)
+ 	BotWord(info, 0x10, 0);
+ 	BotWord(info, 0x30, 0);
+ 	TCE_FaceEnemy(ent);
++	if (IXVO_IsBot(ent->s.number) && !IXVO_BotReadyToFire(ent)) return;
+ 	TCE_BotChooseWeapon(ent, 0);
+ 	clip = BG_FindClipForWeapon(ent->client->ps.weapon);
+ 	if (ent->client->ps.ammoclip[clip] < 1)
+@@ -1722,6 +1727,8 @@ int TCE_CreatePathAStar(gentity_t *ent, int start, int goal, short *path)
+ static void TCE_BotAdvanceRoute(gentity_t *ent, int *state)
+ {
+ 	byte *info = (byte *)&tceBotInfo[ent->s.number];
++	if (IXVO_IsBot(ent->s.number))
++		IXVO_VisitNode(ent, TCE_BotReadShort(info, 0x18));
+ 	BotWord(info, 0x12, TCE_BotReadShort(info, 0x14));
+ 	BotWord(info, 0x14, TCE_BotReadShort(info, 0x16));
+ 	BotWord(info, 0x16, TCE_BotReadShort(info, 0x18));
+@@ -2170,6 +2177,11 @@ void TCE_BotFindLongTermGoal(gentity_t *ent)
+ 	gentity_t *target;
+ 	vec3_t    delta;
+ 	double    random;
++	if (IXVO_IsBot(ent->s.number) && (selected = IXVO_GoalNode(ent)) >= 0)
++	{
++		BotWord(info, 0x36, (short)selected);
++		return;
++	}
+ 	team     = ent->client->sess.sessionTeam;
+ 	carrying = ent->client->ps.powerups[PW_REDFLAG] || ent->client->ps.powerups[PW_BLUEFLAG];
+ 	for (i = 0; i < tceNumNodes; ++i)
+@@ -2240,6 +2252,15 @@ void TCE_BotFindLongTermGoal(gentity_t *ent)
+ 	}
+ 	if (!count && g_gamestate.integer == GS_PLAYING)
+ 	{
++		if (!carrying && ixvo_botExplore.integer && IXVO_IsBot(ent->s.number))
++		{
++			selected = IXVO_PatrolGoal(ent);
++			if (selected >= 0)
++			{
++				BotWord(info, 0x36, (short)selected);
++				return;
++			}
++		}
+ 		choiceCount = 0;
+ 		for (i = 0; i < tceNumNodes; ++i)
+ 			if ((tceNodes[i].flags & 0x200) && choiceCount < 64)
+@@ -2536,7 +2557,9 @@ void TCE_Botthink(gentity_t *ent)
+ 	ent->client->ps.delta_angles[1] = 0;
+ 	ent->client->ps.delta_angles[2] = 0;
+ 	TCE_BotParseServerCommand(ent, &state);
+-	TCE_BotStateActions(ent, &state, &command);
++	if (IXVO_IsBot(ent->s.number)) command.weapon = ent->client->ps.weapon;
++	if (!IXVO_BotOrderMove(ent, &command) && !IXVO_ObjectiveMove(ent, &command))
++		TCE_BotStateActions(ent, &state, &command);
+ 	TCE_BotEvents(ent);
+ 	TCE_BotSendCommand(ent, &state, &command);
+ }
+diff --git a/true-combat/src/game/tce_nodes.c b/true-combat/src/game/tce_nodes.c
+index 782aec7d2423d225b8800fd85c1be6c1d9470527..5d08ccf5b1218b7655a3732cf5624d0759db95b0 100644
+--- a/true-combat/src/game/tce_nodes.c
++++ b/true-combat/src/game/tce_nodes.c
+@@ -246,7 +246,9 @@ void TCE_InitNodes(void)
+ 	trap_FS_FOpenFile(path, &file, FS_READ);
+ 	if (!file)
+ 	{
+-		G_Printf("Couldn't load waypoints for map %s\n", map.string); return;
++		G_Printf("Couldn't load waypoints for map %s\n", map.string);
++		if (IXVO_BotsEnabled()) IXVO_BuildWalkGraph();
++		return;
+ 	}
+ 	trap_FS_FCloseFile(file); TCE_LoadNodes(path);
+ }
