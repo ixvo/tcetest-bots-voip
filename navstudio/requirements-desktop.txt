@@ -1,2 +1,0 @@
-pywebview==6.1
-PyInstaller==6.16.0
