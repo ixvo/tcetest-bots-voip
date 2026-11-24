@@ -1,5 +1,7 @@
 # IXVO voice and bots for Jay’s TCE2 — revision 2
 
+**Please see https://ixvo.org/doku.php?id=tce:ixvo-tce2-backport**
+
 Choose **bots**, **voice**, or **both**. Each patch applies independently. The patches also apply in either order on clean, pinned sources. If you used the original repository-based patch set, start revision 2 in fresh checkouts and a new game home. These are full feature patches, not incremental updates.
 
 | Patch | Changed source | Deployment |
